@@ -117,26 +117,75 @@ def field_regex(n):
     return f + "(?:," + f + "){" + str(n - 1) + "}"
 
 
+# DuckDB's CSV reader is used only as a line splitter: one VARCHAR column, a
+# delimiter, quote, escape and null string that never occur in the data.  It
+# would still end a line at a lone '\r', which the rules treat as an ordinary
+# character, so any file containing '\r' is first copied to scratch with each
+# '\r' replaced by a placeholder byte absent from that file, and the
+# placeholder is turned back into '\r' before parsing.
+RAW_DIR = os.path.join(SCRATCH, "raw_lines")
+RAW_OPTS = ("columns={'line': 'VARCHAR'}, delim='\x01\x02\x03\x04', quote='', escape='', "
+            "header=true, auto_detect=false, strict_mode=false, nullstr='\x02\x03\x04\x01'")
+PLACEHOLDERS = [bytes([b]) for b in (0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0e, 0x0f, 0x10)]
+
+
+def _prepare(job):
+    i, path = job
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if b"\r" not in data:
+        return path, None
+    ph = next(p for p in PLACEHOLDERS if p not in data)
+    os.makedirs(RAW_DIR, exist_ok=True)
+    dst = os.path.join(RAW_DIR, f"{i:06d}.csv")
+    with open(dst, "wb") as fh:
+        fh.write(data.replace(b"\r", ph))
+    return dst, ph
+
+
+_job_counter = [0]
+
+
+def prepare(files):
+    from concurrent.futures import ThreadPoolExecutor
+    jobs = []
+    for p in files:
+        jobs.append((_job_counter[0], p))
+        _job_counter[0] += 1
+    with ThreadPoolExecutor(max_workers=max(1, NCPU)) as pool:
+        return list(pool.map(_prepare, jobs))
+
+
+def sql_list(paths):
+    return "[" + ", ".join("'" + p.replace("'", "''") + "'" for p in paths) + "]"
+
+
 def load_table(name, files, cols):
     """Parse files into table `name` with VARCHAR columns `cols` (NULL for empty).
 
     Lines are split on '\n' only; the header (first line of each file) is
-    skipped; lines with the wrong field count or a stray quote are dropped."""
+    skipped; lines with the wrong field count or a stray quote are dropped
+    (empty lines too: the reader skips them)."""
     n = len(cols)
     sel = ", ".join(f"nullif(f[{i + 1}], '') AS {c}" for i, c in enumerate(cols))
-    if not files:
+    prepared = prepare(files)
+    plain = [p for p, ph in prepared if ph is None]
+    sources = []
+    if plain:
+        sources.append(f"SELECT line FROM read_csv({sql_list(plain)}, {RAW_OPTS})")
+    for p, ph in prepared:
+        if ph is not None:
+            sources.append(f"SELECT replace(line, chr({ph[0]}), chr(13)) AS line "
+                           f"FROM read_csv({sql_list([p])}, {RAW_OPTS})")
+    if not sources:
         con.execute(f"CREATE TABLE {name} AS SELECT " +
                     ", ".join(f"NULL::VARCHAR AS {c}" for c in cols) + " WHERE false")
         return
-    flist = "[" + ", ".join("'" + p.replace("'", "''") + "'" for p in files) + "]"
     con.execute(f"""
         CREATE TABLE {name} AS
         SELECT {sel} FROM (
             SELECT string_split(replace(line, '"', ''), ',') AS f
-            FROM (
-                SELECT unnest(string_split(content, chr(10))[2:]) AS line
-                FROM read_text({flist})
-            )
+            FROM ({" UNION ALL ".join(sources)})
             WHERE regexp_full_match(line, '{field_regex(n)}')
         )
     """)
@@ -230,8 +279,14 @@ con.execute(f"""
 CREATE TABLE evs AS
 SELECT person, is_p, price, category,
        max(CASE WHEN prev IS NULL OR ts - prev > {GAP_MS} THEN ts END)
-           OVER (PARTITION BY person ORDER BY ts ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS start
-FROM (SELECT *, lag(ts) OVER (PARTITION BY person ORDER BY ts) AS prev FROM ev)
+           OVER (PARTITION BY person ORDER BY ts RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS start
+FROM (
+    -- prev = the previous *distinct* ts; RANGE frames treat equal ts as peers,
+    -- so the result never depends on how ties are ordered.
+    SELECT *, max(ts) OVER (PARTITION BY person ORDER BY ts
+                            RANGE BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev
+    FROM ev
+)
 """)
 con.execute(f"""
 CREATE TABLE sess AS
