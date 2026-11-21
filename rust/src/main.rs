@@ -217,6 +217,96 @@ fn for_lines(c: S, mut f: impl FnMut(S)) {
     }
 }
 
+const fn splat(b: u8) -> u64 {
+    b as u64 * 0x0101_0101_0101_0101
+}
+
+/// High bit set in every byte of v that is zero (exact, no false positives).
+#[inline(always)]
+fn zero_bytes(v: u64) -> u64 {
+    let t = (v & 0x7f7f_7f7f_7f7f_7f7f).wrapping_add(0x7f7f_7f7f_7f7f_7f7f);
+    !(t | v | 0x7f7f_7f7f_7f7f_7f7f)
+}
+
+/// The quote rule, given the line's quote count q > 0: every field that is at
+/// least 2 bytes and starts and ends with '"' is enclosed and loses its quotes;
+/// the line is well-formed iff those enclosing quotes are all its quotes
+/// (q == 2 * enclosed). Any other quote anywhere makes q larger.
+#[inline(always)]
+fn unquote_counted<const N: usize>(f: &mut [S; N], q: usize) -> bool {
+    let mut enclosed = 0;
+    for x in f.iter_mut() {
+        let n = x.len();
+        if n >= 2 && x[0] == b'"' && x[n - 1] == b'"' {
+            *x = &x[1..n - 1];
+            enclosed += 1;
+        }
+    }
+    q == 2 * enclosed
+}
+
+/// One SWAR pass (8 bytes at a time) over a chunk of whole lines, finding
+/// ',', '\n' and '"' together: calls f with the N unquoted fields of every
+/// well-formed line. Same dialect as split_fields: only '\n' ends a line,
+/// every comma separates fields, and a wrong field count, a quote anywhere
+/// except around a whole field, or an empty line drops the line.
+#[inline]
+fn for_records<const N: usize>(c: S, mut f: impl FnMut(&[S; N])) {
+    let mut fields: [S; N] = [&[]; N];
+    let (mut commas, mut fstart, mut q, mut lstart) = (0usize, 0usize, 0usize, 0usize);
+    let n = c.len();
+    macro_rules! on {
+        ($pos:expr) => {{
+            let pos = $pos;
+            match c[pos] {
+                b',' => {
+                    if commas < N - 1 {
+                        fields[commas] = &c[fstart..pos];
+                    }
+                    commas += 1;
+                    fstart = pos + 1;
+                }
+                b'"' => q += 1,
+                _ => {
+                    if commas == N - 1 {
+                        fields[N - 1] = &c[fstart..pos];
+                        if q == 0 || unquote_counted(&mut fields, q) {
+                            f(&fields);
+                        }
+                    }
+                    commas = 0;
+                    q = 0;
+                    fstart = pos + 1;
+                    lstart = pos + 1;
+                }
+            }
+        }};
+    }
+    let mut i = 0;
+    while i + 8 <= n {
+        let w = u64::from_le_bytes(c[i..i + 8].try_into().unwrap());
+        let mut m = zero_bytes(w ^ splat(b',')) | zero_bytes(w ^ splat(b'\n')) | zero_bytes(w ^ splat(b'"'));
+        while m != 0 {
+            on!(i + (m.trailing_zeros() / 8) as usize);
+            m &= m - 1;
+        }
+        i += 8;
+    }
+    while i < n {
+        if matches!(c[i], b',' | b'\n' | b'"') {
+            on!(i);
+        }
+        i += 1;
+    }
+    // a last line without '\n' (lstart == n: there is none)
+    if lstart < n && commas == N - 1 {
+        fields[N - 1] = &c[fstart..];
+        if q == 0 || unquote_counted(&mut fields, q) {
+            f(&fields);
+        }
+    }
+}
+
 // ------------------------------------------------------------------ files
 fn csv_files(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = match std::fs::read_dir(dir) {
@@ -410,12 +500,8 @@ impl<'a> Worker<'a> {
         })
     }
 
-    fn event(&mut self, line: S) {
-        let mut f: [S; 7] = [&[]; 7];
-        if !split_fields(line, &mut f) {
-            return;
-        }
-        let [eid, uid, ts, ing, typ, pid, price] = f;
+    fn event(&mut self, f: &[S; 7]) {
+        let [eid, uid, ts, ing, typ, pid, price] = *f;
         if eid.is_empty() {
             return;
         }
@@ -449,12 +535,8 @@ impl<'a> Worker<'a> {
         self.out.ev[(row.h >> 56) as usize].push(row);
     }
 
-    fn click(&mut self, line: S) {
-        let mut f: [S; 4] = [&[]; 4];
-        if !split_fields(line, &mut f) {
-            return;
-        }
-        let [cid, uid, camp, ts] = f;
+    fn click(&mut self, f: &[S; 4]) {
+        let [cid, uid, camp, ts] = *f;
         if cid.is_empty() || uid.is_empty() {
             return;
         }
@@ -468,9 +550,8 @@ impl<'a> Worker<'a> {
         self.out.ck.push(CkRow { cid, ts: t, user, camp });
     }
 
-    fn link(&mut self, line: S) {
-        let mut f: [S; 2] = [&[]; 2];
-        if !split_fields(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
+    fn link(&mut self, f: &[S; 2]) {
+        if f[0].is_empty() || f[1].is_empty() {
             return;
         }
         let a = self.intern(f[0]);
@@ -709,9 +790,9 @@ fn main() {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some(&(kind, c)) = chunks.get(i) else { break };
                         match kind {
-                            Kind::Ev => for_lines(c, |l| w.event(l)),
-                            Kind::Ck => for_lines(c, |l| w.click(l)),
-                            Kind::Lk => for_lines(c, |l| w.link(l)),
+                            Kind::Ev => for_records(c, |f| w.event(f)),
+                            Kind::Ck => for_records(c, |f| w.click(f)),
+                            Kind::Lk => for_records(c, |f| w.link(f)),
                         }
                     }
                     w.out
@@ -1153,4 +1234,80 @@ fn main() {
         pq::write(&cd_dir.join("part-00000.parquet"), CD_SCHEMA, cols).expect("write campaign_daily");
     }
     tm.stage("write parquet");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leak(v: Vec<u8>) -> S {
+        Box::leak(v.into_boxed_slice())
+    }
+
+    /// Reference: line by line with split_fields.
+    fn reference<const N: usize>(chunk: S) -> Vec<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        for_lines(chunk, |l| {
+            let mut f: [S; N] = [&[]; N];
+            if split_fields(l, &mut f) {
+                out.push(f.iter().map(|x| x.to_vec()).collect());
+            }
+        });
+        out
+    }
+
+    fn fast<const N: usize>(chunk: S) -> Vec<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        for_records(chunk, |f: &[S; N]| out.push(f.iter().map(|x| x.to_vec()).collect()));
+        out
+    }
+
+    /// Every line of up to 9 bytes over {a , " \r space}, alone and all in one chunk.
+    fn check<const N: usize>() {
+        let alpha = [b'a', b',', b'"', b'\r', b' '];
+        let mut lines: Vec<Vec<u8>> = vec![vec![]];
+        let mut frontier: Vec<Vec<u8>> = vec![vec![]];
+        for _ in 0..9 {
+            let mut next = Vec::new();
+            for l in &frontier {
+                for &c in &alpha {
+                    let mut m = l.clone();
+                    m.push(c);
+                    next.push(m);
+                }
+            }
+            lines.extend(next.iter().cloned());
+            frontier = next;
+        }
+        let mut all = Vec::new();
+        for l in &lines {
+            for nl in [false, true] {
+                let mut c = l.clone();
+                if nl {
+                    c.push(b'\n');
+                }
+                let c = leak(c);
+                assert_eq!(fast::<N>(c), reference::<N>(c), "line {:?} N={N}", String::from_utf8_lossy(c));
+            }
+            all.extend_from_slice(l);
+            all.push(b'\n');
+        }
+        let all = leak(all);
+        assert_eq!(fast::<N>(all), reference::<N>(all));
+        let trimmed = &all[..all.len() - 1]; // last line without '\n'
+        assert_eq!(fast::<N>(trimmed), reference::<N>(trimmed));
+    }
+
+    #[test]
+    fn records_match_split_fields_2() {
+        check::<2>();
+    }
+    #[test]
+    fn records_match_split_fields_4() {
+        check::<4>();
+    }
+    #[test]
+    fn records_match_split_fields_7() {
+        check::<7>();
+    }
 }
