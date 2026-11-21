@@ -31,6 +31,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+// mimalloc instead of the system allocator (glibc malloc on the scorer):
+// per-thread heaps, so 8 threads growing Vecs do not contend on arena locks.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 type S = &'static [u8];
 type Hs = ahash::RandomState;
 
