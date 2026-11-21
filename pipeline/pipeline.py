@@ -62,47 +62,22 @@ WS = parse_iso(manifest["window_start"])
 WE = parse_iso(manifest["window_end"])
 log(f"window {manifest['window_start']} .. {manifest['window_end']}")
 
-# days_from_civil (H. Hinnant), shifted by 400 years so every operand stays
-# non-negative (DuckDB's // truncates toward zero).
-con.execute("""
-CREATE MACRO civil_days_y(yy, m, d) AS (
-    (yy // 400) * 146097
-    + (yy % 400) * 365 + (yy % 400) // 4 - (yy % 400) // 100
-    + (153 * (m + CASE WHEN m > 2 THEN -3 ELSE 9 END) + 2) // 5 + d - 1
-    - 719468 - 146097
-)
-""")
-con.execute("""
-CREATE MACRO civil_days(y, m, d) AS
-    civil_days_y(y - CASE WHEN m <= 2 THEN 1 ELSE 0 END + 400, m, d)
-""")
-con.execute("""
-CREATE MACRO month_len(y, m) AS CASE
-    WHEN m IN (1, 3, 5, 7, 8, 10, 12) THEN 31
-    WHEN m IN (4, 6, 9, 11) THEN 30
-    WHEN y % 4 = 0 AND (y % 100 <> 0 OR y % 400 = 0) THEN 29
-    ELSE 28 END
-""")
-# F1/F2 with components already extracted as integers.
-con.execute("""
-CREATE MACRO iso_ms(y, mo, d, h, mi, s, zs, zh, zm) AS CASE
-    WHEN mo BETWEEN 1 AND 12 AND d BETWEEN 1 AND month_len(y, mo)
-         AND h < 24 AND mi < 60 AND s < 60 AND zh < 24 AND zm < 60
-    THEN ((civil_days(y, mo, d) * 86400 + h * 3600 + mi * 60 + s)
-          - zs * (zh * 3600 + zm * 60)) * 1000
-    END
-""")
+# F1/F2: the regex pins the exact shape (ASCII digits, 'T', 'Z' or a +HH:MM /
+# -HH:MM offset); try_strptime then rejects impossible calendar values (month
+# 13, Feb 30, Feb 29 outside leap years, hour 24, minute/second 60).
+# F3: ASCII digits only; over 19 significant digits, or over the BIGINT range,
+# is far outside any window, so NULL (bad) is the right answer.
 con.execute(r"""
 CREATE MACRO parse_ts(t) AS CASE
+    WHEN substr(t, 5, 1) = '-' AND regexp_full_match(t, '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2})') THEN
+        CASE WHEN length(t) = 20 THEN epoch_ms(try_strptime(substr(t, 1, 19), '%Y-%m-%dT%H:%M:%S'))
+             WHEN substr(t, 21, 2) < '24' AND substr(t, 24, 2) < '60' THEN
+                 epoch_ms(try_strptime(substr(t, 1, 19), '%Y-%m-%dT%H:%M:%S'))
+                 - (CASE WHEN substr(t, 20, 1) = '+' THEN 1 ELSE -1 END)
+                   * (TRY_CAST(substr(t, 21, 2) AS BIGINT) * 3600000 + TRY_CAST(substr(t, 24, 2) AS BIGINT) * 60000)
+        END
     WHEN regexp_full_match(t, '[0-9]+') THEN
         CASE WHEN length(ltrim(t, '0')) <= 19 THEN TRY_CAST(t AS BIGINT) END
-    WHEN regexp_full_match(t, '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(Z|[+-][0-9]{2}:[0-9]{2})') THEN
-        iso_ms(
-            TRY_CAST(substr(t, 1, 4) AS BIGINT), TRY_CAST(substr(t, 6, 2) AS BIGINT), TRY_CAST(substr(t, 9, 2) AS BIGINT),
-            TRY_CAST(substr(t, 12, 2) AS BIGINT), TRY_CAST(substr(t, 15, 2) AS BIGINT), TRY_CAST(substr(t, 18, 2) AS BIGINT),
-            CASE substr(t, 20, 1) WHEN '+' THEN 1 WHEN '-' THEN -1 ELSE 0 END,
-            CASE WHEN length(t) = 25 THEN TRY_CAST(substr(t, 21, 2) AS BIGINT) ELSE 0 END,
-            CASE WHEN length(t) = 25 THEN TRY_CAST(substr(t, 24, 2) AS BIGINT) ELSE 0 END)
     END
 """)
 
@@ -242,26 +217,41 @@ WHERE l.id <> n.id
 del parent
 
 # ---------------------------------------------------------------- events
+# Dedup: only the few event_ids seen more than once need the arg_min; the rest
+# pass straight through (a full GROUP BY with a struct payload is ~4x slower).
+con.execute("""
+CREATE TABLE dup_ids AS
+SELECT event_id FROM ev_raw WHERE event_id IS NOT NULL GROUP BY event_id HAVING count(*) > 1
+""")
+# Materialized so parse_ts runs once per row (the optimizer would otherwise
+# copy the inlined macro into every filter that mentions ts).
 con.execute(f"""
-CREATE TABLE ev AS
+CREATE TABLE ev_typed AS
 WITH dedup AS (
-    SELECT event_id,
-           arg_min(struct_pack(user_id, ts, event_type, product_id, price_cents), ing) AS r,
-           min(ing) AS ing
-    FROM (SELECT *, epoch_ms(try_strptime(ingest_ts, '%Y-%m-%dT%H:%M:%SZ')) AS ing
-          FROM ev_raw WHERE event_id IS NOT NULL)
+    SELECT user_id, ts, ingest_ts, event_type, product_id, price_cents
+    FROM ev_raw ANTI JOIN dup_ids USING (event_id)
+    WHERE event_id IS NOT NULL
+    UNION ALL
+    SELECT unnest(arg_min(struct_pack(user_id, ts, ingest_ts, event_type, product_id, price_cents),
+                          epoch_ms(try_strptime(ingest_ts, '%Y-%m-%dT%H:%M:%SZ'))))
+    FROM ev_raw SEMI JOIN dup_ids USING (event_id)
     GROUP BY event_id
 ), typed AS (
-    SELECT r.user_id AS user_id, parse_ts(r.ts) AS ts, ing, r.event_type AS event_type,
-           r.product_id AS product_id, r.price_cents AS price_s
+    SELECT user_id, parse_ts(ts) AS ts, epoch_ms(try_strptime(ingest_ts, '%Y-%m-%dT%H:%M:%SZ')) AS ing,
+           event_type, product_id, price_cents AS price_s
     FROM dedup
-), valid AS (
+)
+SELECT * FROM typed
+""")
+con.execute(f"""
+CREATE TABLE ev AS
+WITH valid AS (
     SELECT user_id, ts, event_type, product_id,
            CASE WHEN event_type = 'purchase' THEN
                CASE WHEN regexp_full_match(price_s, '[0-9]+') AND length(ltrim(price_s, '0')) <= 8
                     THEN TRY_CAST(price_s AS BIGINT) END
            END AS price
-    FROM typed
+    FROM ev_typed
     WHERE user_id IS NOT NULL AND ts >= {WS} AND ts < {WE}
       AND event_type IN ('view', 'cart', 'purchase') AND product_id IS NOT NULL
       AND ing - ts <= {DAY_MS}
@@ -277,16 +267,13 @@ log("events validated")
 
 con.execute(f"""
 CREATE TABLE evs AS
+-- Both windows order by (ts, rowid): one total order, so equal timestamps get
+-- the same treatment in each pass.  Only the first of a group of equal ts can
+-- see a gap (the rest see 0), so ties always share a session.
 SELECT person, is_p, price, category,
        max(CASE WHEN prev IS NULL OR ts - prev > {GAP_MS} THEN ts END)
-           OVER (PARTITION BY person ORDER BY ts RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS start
-FROM (
-    -- prev = the previous *distinct* ts; RANGE frames treat equal ts as peers,
-    -- so the result never depends on how ties are ordered.
-    SELECT *, max(ts) OVER (PARTITION BY person ORDER BY ts
-                            RANGE BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev
-    FROM ev
-)
+           OVER (PARTITION BY person ORDER BY ts, rid ROWS UNBOUNDED PRECEDING) AS start
+FROM (SELECT *, rowid AS rid, lag(ts) OVER (PARTITION BY person ORDER BY ts, rowid) AS prev FROM ev)
 """)
 con.execute(f"""
 CREATE TABLE sess AS
