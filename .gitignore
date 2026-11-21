@@ -227,3 +227,7 @@ out/
 __pycache__/
 data/
 out-big/
+
+# Rust build output and run outputs
+rust/target/
+out*/
