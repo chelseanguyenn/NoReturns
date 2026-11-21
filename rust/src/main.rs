@@ -959,17 +959,23 @@ fn main() {
         }
         cks_raw.push(o.ck);
     }
-    let ev_parts: Vec<Vec<Ev>> = shards
+    // Surviving events go straight into person-range buckets, so each bucket
+    // can be sorted on its own and the sessions stage can take whole buckets.
+    let nb = nthreads * 16;
+    let bucket_of = |p: u64| (p as u128 * nb as u128 / nids.max(1) as u128) as usize;
+    let ev_parts: Vec<Vec<Vec<Ev>>> = shards
         .into_par_iter()
         .map(|parts| {
             let mut rows: Vec<EvRow> = parts.concat();
             drop(parts);
             rows.sort_unstable_by_key(|r| (r.h, r.ing));
-            let mut out = Vec::with_capacity(rows.len());
+            let per = rows.len() / nb + rows.len() / (4 * nb) + 4;
+            let mut out: Vec<Vec<Ev>> = (0..nb).map(|_| Vec::with_capacity(per)).collect();
             let mut emit = |r: &EvRow| {
                 if r.valid {
                     let p = person_of(r.tid as usize, r.user) as u64;
-                    out.push(Ev { key: (p << tsh) | (r.ts - ws) as u64, val: ((r.price as u64) << 16) | r.cat as u64 });
+                    out[bucket_of(p)]
+                        .push(Ev { key: (p << tsh) | (r.ts - ws) as u64, val: ((r.price as u64) << 16) | r.cat as u64 });
                 }
             };
             let mut i = 0;
@@ -997,12 +1003,21 @@ fn main() {
             out
         })
         .collect();
-    let mut evs: Vec<Ev> = ev_parts.concat();
-    drop(ev_parts);
     tm.stage("dedup/validate events");
 
     // ---------------------------------------------------------- 5. sort
-    evs.par_sort_unstable_by_key(|e| e.key);
+    let evb: Vec<Vec<Ev>> = (0..nb)
+        .into_par_iter()
+        .map(|b| {
+            let mut v: Vec<Ev> = Vec::with_capacity(ev_parts.iter().map(|sp| sp[b].len()).sum());
+            for sp in &ev_parts {
+                v.extend_from_slice(&sp[b]);
+            }
+            v.sort_unstable_by_key(|e| e.key);
+            v
+        })
+        .collect();
+    std::mem::forget(ev_parts);
     let mut cks: Vec<Ck> = cks_raw
         .par_iter()
         .enumerate()
@@ -1023,23 +1038,6 @@ fn main() {
     let nd = if we > ws { ((we - 1).div_euclid(DAY) - d0 + 1) as usize } else { 1 };
     let tmask = (1u64 << tsh) - 1;
     let cmask = (1u64 << csh) - 1;
-    let n = evs.len();
-    let nparts = nthreads * 16;
-    let mut bounds = vec![0usize];
-    for k in 1..nparts {
-        let b = k * n / nparts;
-        if b == 0 || b >= n {
-            continue;
-        }
-        let prev = evs[b - 1].key >> tsh;
-        let b = evs.partition_point(|e| (e.key >> tsh) <= prev);
-        if b > *bounds.last().unwrap() && b < n {
-            bounds.push(b);
-        }
-    }
-    if n > 0 {
-        bounds.push(n);
-    }
     let new_acc = || Acc {
         ud: Vec::new(),
         sess: vec![0; ncamp * nd],
@@ -1047,10 +1045,14 @@ fn main() {
         rev: vec![0; ncamp * nd],
         assist: vec![0; ncamp * nd],
     };
-    let accs: Vec<Acc> = (0..bounds.len().saturating_sub(1))
+    let accs: Vec<Acc> = (0..nb)
         .into_par_iter()
         .fold(new_acc, |mut acc, part| {
-            let (lo, hi) = (bounds[part], bounds[part + 1]);
+            let evs: &[Ev] = &evb[part]; // whole persons, sorted by (person, ts)
+            let (lo, hi) = (0, evs.len());
+            if hi == 0 {
+                return acc;
+            }
             let first_p = evs[lo].key >> tsh;
             let mut ci = cks.partition_point(|c| (c.key >> csh) < first_p);
             let mut sess: Vec<Sess> = Vec::new();
@@ -1187,7 +1189,7 @@ fn main() {
             acc
         })
         .collect();
-    drop(evs);
+    drop(evb);
     drop(cks);
     tm.stage("sessions/attribution");
 
