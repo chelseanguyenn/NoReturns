@@ -904,7 +904,7 @@ mod pq {
     use bytes::Bytes;
     use parquet::basic::Compression;
     use parquet::data_type::{ByteArray, ByteArrayType, Int32Type, Int64Type};
-    use parquet::file::properties::WriterProperties;
+    use parquet::file::properties::{EnabledStatistics, WriterProperties};
     use parquet::file::writer::SerializedFileWriter;
     use parquet::schema::parser::parse_message_type;
     use std::fs::File;
@@ -920,7 +920,15 @@ mod pq {
 
     pub fn write(path: &Path, schema: &str, cols: Vec<Col>) -> parquet::errors::Result<()> {
         let schema = Arc::new(parse_message_type(schema)?);
-        let props = Arc::new(WriterProperties::builder().set_compression(Compression::UNCOMPRESSED).build());
+        // No dictionaries (user_id is unique per row) and no statistics: less
+        // work per value; any encoding and file size are fine for the outputs.
+        let props = Arc::new(
+            WriterProperties::builder()
+                .set_compression(Compression::UNCOMPRESSED)
+                .set_dictionary_enabled(false)
+                .set_statistics_enabled(EnabledStatistics::None)
+                .build(),
+        );
         let mut w = SerializedFileWriter::new(File::create(path)?, schema, props)?;
         let mut rg = w.next_row_group()?;
         let mut it = cols.into_iter();
