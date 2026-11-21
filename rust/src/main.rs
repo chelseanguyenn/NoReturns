@@ -389,7 +389,8 @@ struct Out {
     ev: Vec<Vec<EvRow>>,
     ck: Vec<CkRow>,
     lk: Vec<(u32, u32)>,
-    keys: Vec<S>,
+    new_keys: Vec<(u32, S)>, // global ids this thread created
+    keys: Vec<S>,            // thread-local (fallback) ids
 }
 
 struct Ctx<'a> {
@@ -419,85 +420,118 @@ fn mix(lo: u64, hi: u64) -> u64 {
     h ^ (h >> 29)
 }
 
-#[derive(Clone, Copy, Default)]
-struct Slot {
-    lo: u64,
-    hi: u64, // 0 = empty
-    id: u32,
+#[repr(C)]
+struct ASlot {
+    hi: std::sync::atomic::AtomicU64, // 0 = empty, BUSY = being written
+    lo: std::sync::atomic::AtomicU64,
+    id: std::sync::atomic::AtomicU64,
 }
+const BUSY: u64 = u64::MAX; // never a real pack: its length byte is at most 15
 
-/// Open-addressing (linear probing) table from packed short IDs to local ids:
-/// one slot read per lookup, no string compare.
-struct IdTable {
-    slots: Vec<Slot>,
+/// One lock-free interning table shared by all parse threads: packed short
+/// IDs -> global ids, linear probing, slots claimed by CAS on `hi`. Fixed
+/// capacity: once `limit` ids exist it refuses new ones (None) and callers
+/// fall back to a thread-local map, so any number of IDs stays correct.
+struct SharedTab {
+    slots: Box<[ASlot]>,
     mask: usize,
-    len: usize,
+    count: AtomicUsize,
+    limit: usize,
 }
 
-impl IdTable {
+impl SharedTab {
     fn new(cap_pow2: usize) -> Self {
-        IdTable { slots: vec![Slot::default(); cap_pow2], mask: cap_pow2 - 1, len: 0 }
+        // Zeroed memory is a valid table of empty atomics, and the OS hands it
+        // out lazily, so an oversized table costs only the pages it touches.
+        let layout = std::alloc::Layout::array::<ASlot>(cap_pow2).unwrap();
+        let slots = unsafe {
+            let p = std::alloc::alloc_zeroed(layout) as *mut ASlot;
+            assert!(!p.is_null(), "out of memory");
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(p, cap_pow2))
+        };
+        SharedTab { slots, mask: cap_pow2 - 1, count: AtomicUsize::new(0), limit: cap_pow2 / 2 }
     }
+
+    /// The id of (lo, hi), inserting it if new (then calls on_new with the id).
+    /// None if it is new and the table is at its limit.
     #[inline]
-    fn slot_of(&self, lo: u64, hi: u64) -> usize {
-        (mix(lo, hi) as usize) & self.mask
-    }
-    fn grow(&mut self) {
-        let old = std::mem::replace(&mut self.slots, vec![Slot::default(); (self.mask + 1) * 2]);
-        self.mask = self.slots.len() - 1;
-        for s in old.into_iter().filter(|s| s.hi != 0) {
-            let mut i = self.slot_of(s.lo, s.hi);
-            while self.slots[i].hi != 0 {
-                i = (i + 1) & self.mask;
-            }
-            self.slots[i] = s;
-        }
-    }
-    #[inline]
-    fn get_or_insert(&mut self, lo: u64, hi: u64, new_id: impl FnOnce() -> u32) -> u32 {
-        if (self.len + 1) * 2 > self.slots.len() {
-            self.grow();
-        }
-        let mut i = self.slot_of(lo, hi);
+    fn get_or_insert(&self, lo: u64, hi: u64, on_new: impl FnOnce(u32)) -> Option<u32> {
+        let mut i = (mix(lo, hi) as usize) & self.mask;
         loop {
-            let s = &mut self.slots[i];
-            if s.hi == hi && s.lo == lo {
-                return s.id;
+            let s = &self.slots[i];
+            let mut h = s.hi.load(Ordering::Acquire);
+            if h == 0 {
+                if self.count.load(Ordering::Relaxed) >= self.limit {
+                    return None;
+                }
+                match s.hi.compare_exchange(0, BUSY, Ordering::Acquire, Ordering::Acquire) {
+                    Ok(_) => {
+                        let id = self.count.fetch_add(1, Ordering::Relaxed) as u32;
+                        s.lo.store(lo, Ordering::Relaxed);
+                        s.id.store(id as u64, Ordering::Relaxed);
+                        s.hi.store(hi, Ordering::Release); // publishes lo and id
+                        on_new(id);
+                        return Some(id);
+                    }
+                    Err(cur) => h = cur,
+                }
             }
-            if s.hi == 0 {
-                let id = new_id();
-                *s = Slot { lo, hi, id };
-                self.len += 1;
-                return id;
+            while h == BUSY {
+                std::hint::spin_loop();
+                h = s.hi.load(Ordering::Acquire);
+            }
+            if h == hi && s.lo.load(Ordering::Relaxed) == lo {
+                return Some(s.id.load(Ordering::Relaxed) as u32);
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+
+    /// Read-only lookup, for after the parse.
+    fn find(&self, lo: u64, hi: u64) -> Option<u32> {
+        let mut i = (mix(lo, hi) as usize) & self.mask;
+        loop {
+            let s = &self.slots[i];
+            let h = s.hi.load(Ordering::Acquire);
+            if h == 0 {
+                return None;
+            }
+            if h == hi && s.lo.load(Ordering::Relaxed) == lo {
+                return Some(s.id.load(Ordering::Relaxed) as u32);
             }
             i = (i + 1) & self.mask;
         }
     }
 }
 
+/// Marks a thread-local id (an ID the shared table did not take).
+const LOCAL: u32 = 1 << 31;
+
 struct Worker<'a> {
     ctx: &'a Ctx<'a>,
     tid: u8,
-    tab: IdTable,          // IDs of up to 15 bytes
-    map: HashMap<S, u32, Hs>, // longer IDs (same local id space)
+    shared: &'a SharedTab,
+    map: HashMap<S, u32, Hs>, // fallback: long IDs, or the shared table at its limit
     out: Out,
 }
 
 impl<'a> Worker<'a> {
     #[inline]
+    /// A global id, or LOCAL | a thread-local id (resolved after the parse).
     fn intern(&mut self, k: S) -> u32 {
-        let keys = &mut self.out.keys;
         if k.len() <= 15 {
             let (lo, hi) = pack(k);
-            return self.tab.get_or_insert(lo, hi, || {
+            let new_keys = &mut self.out.new_keys;
+            if let Some(g) = self.shared.get_or_insert(lo, hi, |g| new_keys.push((g, k))) {
+                return g;
+            }
+        }
+        let keys = &mut self.out.keys;
+        LOCAL
+            | *self.map.entry(k).or_insert_with(|| {
                 keys.push(k);
                 (keys.len() - 1) as u32
-            });
-        }
-        *self.map.entry(k).or_insert_with(|| {
-            keys.push(k);
-            (keys.len() - 1) as u32
-        })
+            })
     }
 
     fn event(&mut self, f: &[S; 7]) {
@@ -768,21 +802,26 @@ fn main() {
 
     // ---------------------------------------------------------- 1. parse
     let ctx = Ctx { ws, we, cws, products: &products, unknown, campaigns: &campaigns, h: hasher() };
+    // Sized from the input: generated data has about 0.055 distinct IDs per
+    // line (~70 bytes); this allows ~4x that before the fallback kicks in.
+    let total_bytes: usize = chunks.iter().map(|c| c.1.len()).sum();
+    let shared = SharedTab::new((total_bytes / 70 / 2).next_power_of_two().clamp(1 << 16, 1 << 30));
     let next = AtomicUsize::new(0);
     let outs: Vec<Out> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..nthreads)
             .map(|t| {
-                let (ctx, next, chunks) = (&ctx, &next, &chunks);
+                let (ctx, next, chunks, shared) = (&ctx, &next, &chunks, &shared);
                 sc.spawn(move || {
                     let mut w = Worker {
                         ctx,
                         tid: t as u8,
-                        tab: IdTable::new(1 << 16),
+                        shared,
                         map: HashMap::with_hasher(hasher()),
                         out: Out {
                             ev: (0..NSHARD).map(|_| Vec::new()).collect(),
                             ck: Vec::new(),
                             lk: Vec::new(),
+                            new_keys: Vec::new(),
                             keys: Vec::new(),
                         },
                     };
@@ -804,24 +843,51 @@ fn main() {
     tm.stage("read/parse csv");
 
     // ---------------------------------------------------------- 2. global IDs
-    // Every thread saw nearly every ID, so first dedup across threads: hash-
-    // partition all (thread, local id) keys, dedup each partition with a small
-    // cache-resident table, then sort only the distinct IDs to get byte-wise
-    // ranks and write each (thread, local id)'s rank back.
-    const NPART: usize = 256;
-    #[derive(Clone, Copy)]
-    struct E {
-        lo: u64,
-        hi: u64, // 0: a long ID, lo = its hash; compare by string
-        t: u32,
-        l: u32,
+    // Global ids come from the shared table; thread-local (fallback) IDs are
+    // looked up there first (another thread may have inserted them just
+    // before the table reached its limit) and otherwise get new global ids.
+    let mut gnames: Vec<S> = vec![&[]; shared.count.load(Ordering::Relaxed)];
+    for o in &outs {
+        for &(g, k) in &o.new_keys {
+            gnames[g as usize] = k;
+        }
     }
+    let mut extra: HashMap<S, u32, Hs> = HashMap::with_hasher(hasher());
+    let mut local_gid: Vec<Vec<u32>> = Vec::with_capacity(outs.len());
+    for o in &outs {
+        let mut v = Vec::with_capacity(o.keys.len());
+        for &k in &o.keys {
+            let found = if k.len() <= 15 {
+                let (lo, hi) = pack(k);
+                shared.find(lo, hi)
+            } else {
+                None
+            };
+            v.push(found.unwrap_or_else(|| {
+                *extra.entry(k).or_insert_with(|| {
+                    gnames.push(k);
+                    (gnames.len() - 1) as u32
+                })
+            }));
+        }
+        local_gid.push(v);
+    }
+    drop(extra);
+    drop(shared);
+    let nids = gnames.len();
+    if std::env::var_os("VERBOSE").is_some() {
+        eprintln!(
+            "ids: {} distinct, {} via thread-local fallback",
+            nids,
+            outs.iter().map(|o| o.keys.len()).sum::<usize>()
+        );
+    }
+    // byte-wise rank of every global id
     #[derive(Clone, Copy)]
     struct K {
         pre: u128,
         s: S,
-        p: u32,
-        d: u32,
+        g: u32,
     }
     #[inline]
     fn prefix(s: S) -> u128 {
@@ -830,69 +896,18 @@ fn main() {
         b[..n].copy_from_slice(&s[..n]);
         u128::from_be_bytes(b)
     }
-    let kh = hasher();
-    let buckets: Vec<Vec<Vec<E>>> = outs
-        .par_iter()
-        .enumerate()
-        .map(|(t, o)| {
-            let mut b: Vec<Vec<E>> = (0..NPART).map(|_| Vec::with_capacity(o.keys.len() / NPART * 5 / 4 + 16)).collect();
-            for (l, &s) in o.keys.iter().enumerate() {
-                let (lo, hi) = if s.len() <= 15 { pack(s) } else { (kh.hash_one(s), 0) };
-                b[(mix(lo, hi) >> 56) as usize].push(E { lo, hi, t: t as u32, l: l as u32 });
-            }
-            b
-        })
-        .collect();
-    let rank_at: Vec<Vec<std::sync::atomic::AtomicU32>> =
-        outs.iter().map(|o| (0..o.keys.len()).map(|_| std::sync::atomic::AtomicU32::new(0)).collect()).collect();
-    // per partition: distinct IDs, and the (t, l) -> partition-local index map
-    let parts: Vec<(Vec<S>, Vec<(u32, u32, u32)>)> = (0..NPART)
-        .into_par_iter()
-        .map(|p| {
-            let n: usize = buckets.iter().map(|b| b[p].len()).sum();
-            let mut tab = IdTable::new((n * 2).next_power_of_two().max(16));
-            let mut long: HashMap<S, u32, Hs> = HashMap::with_hasher(hasher());
-            let mut uniq: Vec<S> = Vec::new();
-            let mut codes = Vec::with_capacity(n);
-            for b in &buckets {
-                for e in &b[p] {
-                    let s = outs[e.t as usize].keys[e.l as usize];
-                    let new_id = || {
-                        uniq.push(s);
-                        (uniq.len() - 1) as u32
-                    };
-                    let d = if e.hi != 0 { tab.get_or_insert(e.lo, e.hi, new_id) } else { *long.entry(s).or_insert_with(new_id) };
-                    codes.push((e.t, e.l, d));
-                }
-            }
-            (uniq, codes)
-        })
-        .collect();
-    drop(buckets);
-    let mut ks: Vec<K> = parts
-        .par_iter()
-        .enumerate()
-        .flat_map_iter(|(p, (uniq, _))| uniq.iter().enumerate().map(move |(d, &s)| K { pre: prefix(s), s, p: p as u32, d: d as u32 }))
-        .collect();
+    let mut ks: Vec<K> = gnames.par_iter().enumerate().map(|(g, &s)| K { pre: prefix(s), s, g: g as u32 }).collect();
     ks.par_sort_unstable_by(|a, b| a.pre.cmp(&b.pre).then_with(|| a.s.cmp(b.s)));
-    let names: Vec<S> = ks.iter().map(|k| k.s).collect();
-    let mut rank_pd: Vec<Vec<u32>> = parts.iter().map(|(u, _)| vec![0u32; u.len()]).collect();
+    let names: Vec<S> = ks.par_iter().map(|k| k.s).collect();
+    let mut rank_g: Vec<u32> = vec![0; nids];
     for (r, k) in ks.iter().enumerate() {
-        rank_pd[k.p as usize][k.d as usize] = r as u32;
+        rank_g[k.g as usize] = r as u32;
     }
     drop(ks);
-    parts.par_iter().zip(&rank_pd).for_each(|((_, codes), rp)| {
-        for &(t, l, d) in codes {
-            rank_at[t as usize][l as usize].store(rp[d as usize], Ordering::Relaxed);
-        }
-    });
-    drop(parts);
-    let rank: Vec<Vec<u32>> =
-        rank_at.into_par_iter().map(|v| v.into_iter().map(|a| a.into_inner()).collect()).collect();
-    let nids = names.len();
-    if std::env::var_os("VERBOSE").is_some() {
-        eprintln!("ids: {} thread-local keys, {} distinct", outs.iter().map(|o| o.keys.len()).sum::<usize>(), nids);
-    }
+    drop(gnames);
+    let gid = |t: usize, u: u32| -> usize {
+        if u & LOCAL == 0 { u as usize } else { local_gid[t][(u & !LOCAL) as usize] as usize }
+    };
     tm.stage("intern ids");
 
     // ---------------------------------------------------------- 3. union-find
@@ -905,10 +920,10 @@ fn main() {
         }
         x
     }
-    for (o, r) in outs.iter().zip(&rank) {
+    for (t, o) in outs.iter().enumerate() {
         for &(a, b) in &o.lk {
-            let ra = find(&mut parent, r[a as usize]);
-            let rb = find(&mut parent, r[b as usize]);
+            let ra = find(&mut parent, rank_g[gid(t, a)]);
+            let rb = find(&mut parent, rank_g[gid(t, b)]);
             if ra < rb {
                 parent[rb as usize] = ra;
             } else if rb < ra {
@@ -921,9 +936,14 @@ fn main() {
         let p = parent[i] as usize;
         parent[i] = parent[p];
     }
-    let person: Vec<Vec<u32>> =
-        rank.par_iter().map(|r| r.iter().map(|&g| parent[g as usize]).collect()).collect();
-    drop(rank);
+    // person (the root's rank, i.e. an index into names) of every global id
+    let person_g: Vec<u32> = rank_g.par_iter().map(|&r| parent[r as usize]).collect();
+    let person_l: Vec<Vec<u32>> =
+        local_gid.par_iter().map(|v| v.iter().map(|&g| person_g[g as usize]).collect()).collect();
+    let person_of = |t: usize, u: u32| -> u32 {
+        if u & LOCAL == 0 { person_g[u as usize] } else { person_l[t][(u & !LOCAL) as usize] }
+    };
+    drop(rank_g);
     drop(parent);
     tm.stage("links (union-find)");
 
@@ -948,7 +968,7 @@ fn main() {
             let mut out = Vec::with_capacity(rows.len());
             let mut emit = |r: &EvRow| {
                 if r.valid {
-                    let p = person[r.tid as usize][r.user as usize] as u64;
+                    let p = person_of(r.tid as usize, r.user) as u64;
                     out.push(Ev { key: (p << tsh) | (r.ts - ws) as u64, val: ((r.price as u64) << 16) | r.cat as u64 });
                 }
             };
@@ -987,16 +1007,14 @@ fn main() {
         .par_iter()
         .enumerate()
         .flat_map_iter(|(t, v)| {
-            let pt = &person[t];
             v.iter().map(move |c| Ck {
-                key: ((pt[c.user as usize] as u64) << csh) | (c.ts - cws) as u64,
+                key: ((person_of(t, c.user) as u64) << csh) | (c.ts - cws) as u64,
                 camp: c.camp,
                 cid: c.cid,
             })
         })
         .collect();
     drop(cks_raw);
-    drop(person);
     cks.par_sort_unstable_by(|a, b| a.key.cmp(&b.key).then_with(|| a.cid.cmp(b.cid)));
     tm.stage("sort events/clicks");
 
