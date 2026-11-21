@@ -157,9 +157,106 @@ fn parse_digits(b: &[u8]) -> Option<i64> {
     if sig > 19 || v > i64::MAX as u64 { Some(i64::MAX) } else { Some(v as i64) }
 }
 
+/// Reference parser (the tests check TsParser against it).
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline]
 fn parse_ts(b: &[u8]) -> Option<i64> {
     if b.len() >= 5 && b[4] == b'-' { parse_iso(b) } else { parse_digits(b) }
+}
+
+/// Eight ASCII digits (b[0] most significant) to their value, or None (SWAR, exact).
+#[inline(always)]
+fn parse8(b: &[u8]) -> Option<u64> {
+    let w = u64::from_le_bytes(b[..8].try_into().unwrap());
+    // byte in 0x30..=0x3F, and byte + 6 still in 0x30..=0x3F: exactly '0'..='9'
+    if w & 0xF0F0_F0F0_F0F0_F0F0 != 0x3030_3030_3030_3030
+        || w.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0 != 0x3030_3030_3030_3030
+    {
+        return None;
+    }
+    let mut v = w - 0x3030_3030_3030_3030;
+    v = v.wrapping_mul(10).wrapping_add(v >> 8);
+    v = ((v & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32))
+        .wrapping_add(((v >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32))))
+        >> 32;
+    Some(v)
+}
+
+/// Per-thread timestamp parser: same results as parse_ts / parse_iso, with
+/// fast paths for the common forms. F1/F2 cache the day number of each
+/// validated `YYYY-MM-DD` (a window spans ~21 dates); F3 of exactly 13
+/// digits is parsed 8 digits at a time.
+struct TsParser {
+    date_key: [u64; 128], // bytes 0..8 of the date ("YYYY-MM-"), 0 = empty
+    date_days: [i64; 128],
+}
+
+impl TsParser {
+    fn new() -> Self {
+        TsParser { date_key: [0; 128], date_days: [0; 128] }
+    }
+
+    #[inline]
+    fn iso(&mut self, b: &[u8]) -> Option<i64> {
+        let n = b.len();
+        if n != 20 && n != 25 {
+            return None;
+        }
+        if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+            return None;
+        }
+        let dd = d2(b, 8)?; // 0..=99
+        let key = u64::from_le_bytes(b[..8].try_into().unwrap());
+        let days = if self.date_key[dd as usize] == key {
+            self.date_days[dd as usize]
+        } else {
+            let y = d2(b, 0)? * 100 + d2(b, 2)?;
+            let mo = d2(b, 5)?;
+            if y == 0 || !(1..=12).contains(&mo) || dd < 1 || dd > days_in_month(y, mo) {
+                return None;
+            }
+            let days = days_from_civil(y, mo, dd);
+            self.date_key[dd as usize] = key;
+            self.date_days[dd as usize] = days;
+            days
+        };
+        let h = d2(b, 11)?;
+        let mi = d2(b, 14)?;
+        let s = d2(b, 17)?;
+        if h > 23 || mi > 59 || s > 59 {
+            return None;
+        }
+        let ms = ((days * 24 + h) * 60 + mi) * 60_000 + s * 1000;
+        if n == 20 {
+            return if b[19] == b'Z' { Some(ms) } else { None };
+        }
+        let sign = b[19];
+        if (sign != b'+' && sign != b'-') || b[22] != b':' {
+            return None;
+        }
+        let oh = d2(b, 20)?;
+        let om = d2(b, 23)?;
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        let off = (oh * 60 + om) * 60_000;
+        Some(if sign == b'+' { ms - off } else { ms + off })
+    }
+
+    #[inline]
+    fn ts(&mut self, b: &[u8]) -> Option<i64> {
+        if b.len() == 13 {
+            // 13 digits: digits 0..8 and 5..13 (overlapping) cover them all
+            let hi = parse8(&b[0..8]);
+            let lo = parse8(&b[5..13]);
+            // not all digits: not F3, and too short for F1/F2
+            return match (hi, lo) {
+                (Some(h), Some(l)) => Some((h * 100_000 + l % 100_000) as i64),
+                _ => None,
+            };
+        }
+        if b.len() >= 5 && b[4] == b'-' { self.iso(b) } else { parse_digits(b) }
+    }
 }
 
 #[inline]
@@ -510,6 +607,7 @@ const LOCAL: u32 = 1 << 31;
 struct Worker<'a> {
     ctx: &'a Ctx<'a>,
     tid: u8,
+    tsp: TsParser,
     shared: &'a SharedTab,
     map: HashMap<S, u32, Hs>, // fallback: long IDs, or the shared table at its limit
     out: Out,
@@ -540,7 +638,7 @@ impl<'a> Worker<'a> {
             return;
         }
         let c = self.ctx;
-        let ing = parse_iso(ing).unwrap_or(i64::MAX);
+        let ing = self.tsp.iso(ing).unwrap_or(i64::MAX);
         let mut row =
             EvRow { lo: 0, hi: 0, ing, ts: 0, user: 0, price: 0, cat: 0, valid: false, tid: self.tid };
         // Validity of this copy (rules: validate the kept copy, then drop late events).
@@ -548,7 +646,7 @@ impl<'a> Worker<'a> {
             if uid.is_empty() || pid.is_empty() {
                 break 'v;
             }
-            let Some(t) = parse_ts(ts) else { break 'v };
+            let Some(t) = self.tsp.ts(ts) else { break 'v };
             if t < c.ws || t >= c.we || ing.saturating_sub(t) > DAY {
                 break 'v;
             }
@@ -580,7 +678,7 @@ impl<'a> Worker<'a> {
             return;
         }
         let c = self.ctx;
-        let Some(t) = parse_ts(ts) else { return };
+        let Some(t) = self.tsp.ts(ts) else { return };
         if t < c.cws || t >= c.we {
             return;
         }
@@ -820,6 +918,7 @@ fn main() {
                     let mut w = Worker {
                         ctx,
                         tid: t as u8,
+                        tsp: TsParser::new(),
                         shared,
                         map: HashMap::with_hasher(hasher()),
                         out: Out {
@@ -1319,6 +1418,39 @@ mod tests {
         assert_eq!(fast::<N>(all), reference::<N>(all));
         let trimmed = &all[..all.len() - 1]; // last line without '\n'
         assert_eq!(fast::<N>(trimmed), reference::<N>(trimmed));
+    }
+
+    #[test]
+    fn ts_parser_matches_reference() {
+        let mut p = TsParser::new();
+        let mut cases: Vec<String> = Vec::new();
+        for y in ["2024", "2025", "2027", "2028", "2100", "2000", "0000", "1970", "9999", "２０26"] {
+            for m in ["01", "02", "03", "04", "09", "10", "12", "13", "00", "1a"] {
+                for d in ["01", "09", "10", "28", "29", "30", "31", "32", "00", "3 "] {
+                    for t in ["00:00:00", "23:59:59", "24:00:00", "12:60:00", "12:00:60", "1x:00:00"] {
+                        for z in ["Z", "z", "+00:00", "-00:00", "+23:59", "+24:00", "+05:60", "-10:00", "+0200", "", "ZZ"] {
+                            cases.push(format!("{y}-{m}-{d}T{t}{z}"));
+                        }
+                    }
+                }
+            }
+        }
+        for s in ["1791071890000", "0001791071890000", "86400000", "1791071890000.0", "179107189000a", "a791071890000",
+                  "17910718900001", "179107189000", "0000000000000", "9999999999999", "1.79e12", "-5", "", " 1791071890000",
+                  "1791071890000\r", "999999999999999999999", "0x00000000000", "2026-10-03 23:58:10Z", "2026-10-03t23:58:10Z"] {
+            cases.push(s.to_string());
+        }
+        // exercise the date cache with repeats and with different years on the same day
+        let mut all = cases.clone();
+        all.extend(cases.iter().rev().cloned());
+        for c in &all {
+            let b = c.as_bytes();
+            assert_eq!(p.ts(b), parse_ts(b), "ts {c:?}");
+            assert_eq!(p.iso(b), parse_iso(b), "iso {c:?}");
+        }
+        for v in [0u64, 1, 12345678, 99999999, 10000000, 87654321] {
+            assert_eq!(parse8(format!("{v:08}").as_bytes()), Some(v));
+        }
     }
 
     #[test]
