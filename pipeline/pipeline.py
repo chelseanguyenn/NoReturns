@@ -118,10 +118,18 @@ PLACEHOLDERS = [bytes([b]) for b in (0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0
 
 def _prepare(job):
     i, path = job
+    # Scan in 8 MB chunks: bounded memory (a big part file is ~360 MB), and it
+    # warms the page cache for DuckDB's read right after.  (mmap was slower
+    # through Docker's bind mounts.)
+    with open(path, "rb", buffering=0) as fh:
+        while True:
+            chunk = fh.read(8 << 20)
+            if not chunk:
+                return path, None
+            if b"\r" in chunk:
+                break
     with open(path, "rb") as fh:
         data = fh.read()
-    if b"\r" not in data:
-        return path, None
     ph = next(p for p in PLACEHOLDERS if p not in data)
     os.makedirs(RAW_DIR, exist_ok=True)
     dst = os.path.join(RAW_DIR, f"{i:06d}.csv")
@@ -156,6 +164,7 @@ def load_table(name, files, cols):
     n = len(cols)
     sel = ", ".join(f"nullif(f[{i + 1}], '') AS {c}" for i, c in enumerate(cols))
     prepared = prepare(files)
+    log(f"  {name}: \\r scan of {len(files)} files done")
     plain = [p for p, ph in prepared if ph is None]
     sources = []
     if plain:
@@ -259,6 +268,7 @@ con.execute("""
 CREATE TABLE dup_ids AS
 SELECT event_id FROM ev_raw WHERE event_id IS NOT NULL GROUP BY event_id HAVING count(*) > 1
 """)
+log("  dup_ids")
 # Materialized so parse_ts runs once per row (the optimizer would otherwise
 # copy the inlined macro into every filter that mentions ts).
 con.execute(f"""
@@ -279,6 +289,7 @@ WITH dedup AS (
 )
 SELECT * FROM typed
 """)
+log("  ev_typed (dedup + parse_ts)")
 con.execute(f"""
 CREATE TABLE ev AS
 WITH valid AS (
@@ -328,12 +339,14 @@ SELECT person, is_p, price, category,
            OVER (PARTITION BY person ORDER BY ts, rid ROWS UNBOUNDED PRECEDING) AS start
 FROM (SELECT *, rowid AS rid, lag(ts) OVER (PARTITION BY person ORDER BY ts, rowid) AS prev FROM ev)
 """)
+log("  evs (windows)")
 con.execute(f"""
 CREATE TABLE sess AS
 SELECT person, start, (DATE '1970-01-01' + (start // {DAY_MS})::INTEGER) AS day,
        count(*) AS n_events, sum(price) AS revenue, bool_or(is_p) AS has_p
 FROM evs GROUP BY person, start
 """)
+log("  sess")
 stage("sessionize")
 con.execute("DROP TABLE ev")
 
