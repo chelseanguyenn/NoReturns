@@ -155,14 +155,18 @@ def sql_list(paths):
     return "[" + ", ".join("'" + p.replace("'", "''") + "'" for p in paths) + "]"
 
 
-def load_table(name, files, cols):
-    """Parse files into table `name` with VARCHAR columns `cols` (NULL for empty).
+def load_table(name, files, cols, select=None, where="true"):
+    """Parse files into table `name`.
 
     Lines are split on '\n' only; the header (first line of each file) is
     skipped; lines with the wrong field count or a stray quote are dropped
-    (empty lines too: the reader skips them)."""
+    (empty lines too: the reader skips them).  Each field becomes a VARCHAR
+    named by `cols` (NULL for empty); `select` and `where`, if given, are
+    applied to those fields in the same pass, so typed columns are computed
+    once while the line is in hand instead of in a second pass over a table."""
     n = len(cols)
     sel = ", ".join(f"nullif(f[{i + 1}], '') AS {c}" for i, c in enumerate(cols))
+    select = select or ", ".join(cols)
     prepared = prepare(files)
     log(f"  {name}: \\r scan of {len(files)} files done")
     plain = [p for p, ph in prepared if ph is None]
@@ -174,16 +178,16 @@ def load_table(name, files, cols):
             sources.append(f"SELECT replace(line, chr({ph[0]}), chr(13)) AS line "
                            f"FROM read_csv({sql_list([p])}, {RAW_OPTS})")
     if not sources:
-        con.execute(f"CREATE TABLE {name} AS SELECT " +
-                    ", ".join(f"NULL::VARCHAR AS {c}" for c in cols) + " WHERE false")
-        return
+        sources.append("SELECT NULL::VARCHAR AS line WHERE false")
     con.execute(f"""
         CREATE TABLE {name} AS
-        SELECT {sel} FROM (
-            SELECT string_split(replace(line, '"', ''), ',') AS f
-            FROM ({" UNION ALL ".join(sources)})
-            WHERE regexp_full_match(line, '{field_regex(n)}')
-        )
+        SELECT {select} FROM (
+            SELECT {sel} FROM (
+                SELECT string_split(replace(line, '"', ''), ',') AS f
+                FROM ({" UNION ALL ".join(sources)})
+                WHERE regexp_full_match(line, '{field_regex(n)}')
+            )
+        ) WHERE {where}
     """)
 
 
@@ -193,10 +197,32 @@ load_table("products", [os.path.join(DATA, "products.csv")], ["product_id", "cat
 load_table("campaigns", [os.path.join(DATA, "campaigns.csv")], ["campaign_id", "channel"])
 load_table("links_raw", csv_files("links"), ["a", "b"])
 stage("read/parse links+lookups")
+# Events, typed in the parsing pass.  Every copy is typed, but nothing is
+# filtered except an empty event_id: validation applies to the copy dedup
+# keeps.  t: 0 = bad type or empty product_id, 1 = view/cart, 2 = purchase.
+# prod is kept only for purchases (the only rows that need a category).
+# price is NULL unless the row is a purchase with digits-only price_cents of
+# at most 8 significant digits (anything longer is over 10,000,000 anyway).
 load_table("ev_raw", csv_files("events"),
-           ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"])
+           ["event_id", "user_id", "ts_s", "ingest_s", "etype", "product_id", "price_s"],
+           select=f"""event_id, user_id, parse_ts(ts_s) AS ts,
+                      epoch_ms(try_strptime(ingest_s, '%Y-%m-%dT%H:%M:%SZ')) AS ing,
+                      (CASE WHEN product_id IS NULL THEN 0
+                            WHEN etype IN ('view', 'cart') THEN 1
+                            WHEN etype = 'purchase' THEN 2 ELSE 0 END)::UTINYINT AS t,
+                      CASE WHEN etype = 'purchase' THEN product_id END AS prod,
+                      CASE WHEN etype = 'purchase' AND regexp_full_match(price_s, '[0-9]+')
+                                AND length(ltrim(price_s, '0')) <= 8
+                           THEN TRY_CAST(price_s AS BIGINT) END AS price""",
+           where="event_id IS NOT NULL")
 stage("read/parse events")
-load_table("ck_raw", csv_files("clicks"), ["click_id", "user_id", "campaign_id", "ts"])
+# Clicks are validated in the parsing pass too (no dedup can pick a bad copy:
+# copies are identical).  Duplicates are left in: the credit arg_min and the
+# assist DISTINCT both give the same answer with or without them.
+load_table("ck_raw", csv_files("clicks"), ["click_id", "user_id", "campaign_id", "ts_s"],
+           select="click_id, user_id, campaign_id, parse_ts(ts_s) AS ts",
+           where="click_id IS NOT NULL AND user_id IS NOT NULL "
+                 "AND campaign_id IN (SELECT campaign_id FROM campaigns)")
 stage("read/parse clicks")
 
 # ---------------------------------------------------------------- linked IDs
@@ -266,62 +292,36 @@ stage("links (components)")
 # pass straight through (a full GROUP BY with a struct payload is ~4x slower).
 con.execute("""
 CREATE TABLE dup_ids AS
-SELECT event_id FROM ev_raw WHERE event_id IS NOT NULL GROUP BY event_id HAVING count(*) > 1
+SELECT event_id FROM ev_raw GROUP BY event_id HAVING count(*) > 1
 """)
 log("  dup_ids")
-# Materialized so parse_ts runs once per row (the optimizer would otherwise
-# copy the inlined macro into every filter that mentions ts).
-con.execute(f"""
-CREATE TABLE ev_typed AS
-WITH dedup AS (
-    SELECT user_id, ts, ingest_ts, event_type, product_id, price_cents
-    FROM ev_raw ANTI JOIN dup_ids USING (event_id)
-    WHERE event_id IS NOT NULL
-    UNION ALL
-    SELECT unnest(arg_min(struct_pack(user_id, ts, ingest_ts, event_type, product_id, price_cents),
-                          epoch_ms(try_strptime(ingest_ts, '%Y-%m-%dT%H:%M:%SZ'))))
-    FROM ev_raw SEMI JOIN dup_ids USING (event_id)
-    GROUP BY event_id
-), typed AS (
-    SELECT user_id, parse_ts(ts) AS ts, epoch_ms(try_strptime(ingest_ts, '%Y-%m-%dT%H:%M:%SZ')) AS ing,
-           event_type, product_id, price_cents AS price_s
-    FROM dedup
-)
-SELECT * FROM typed
-""")
-log("  ev_typed (dedup + parse_ts)")
+# ev: valid kept copies.  price is 0 for view/cart; prod IS NOT NULL marks a purchase.
 con.execute(f"""
 CREATE TABLE ev AS
-WITH valid AS (
-    SELECT user_id, ts, event_type, product_id,
-           CASE WHEN event_type = 'purchase' THEN
-               CASE WHEN regexp_full_match(price_s, '[0-9]+') AND length(ltrim(price_s, '0')) <= 8
-                    THEN TRY_CAST(price_s AS BIGINT) END
-           END AS price
-    FROM ev_typed
-    WHERE user_id IS NOT NULL AND ts >= {WS} AND ts < {WE}
-      AND event_type IN ('view', 'cart', 'purchase') AND product_id IS NOT NULL
-      AND ing - ts <= {DAY_MS}
+WITH dedup AS (
+    SELECT user_id, ts, ing, t, prod, price
+    FROM ev_raw ANTI JOIN dup_ids USING (event_id)
+    UNION ALL
+    SELECT unnest(arg_min(struct_pack(user_id, ts, ing, t, prod, price), ing))
+    FROM ev_raw SEMI JOIN dup_ids USING (event_id)
+    GROUP BY event_id
 )
-SELECT coalesce(pm.person, v.user_id) AS person, v.ts, v.event_type = 'purchase' AS is_p,
-       coalesce(v.price, 0) AS price, coalesce(p.category, 'unknown') AS category
-FROM valid v
-LEFT JOIN pmap pm ON pm.id = v.user_id
-LEFT JOIN products p ON p.product_id = v.product_id
-WHERE v.event_type <> 'purchase' OR v.price BETWEEN 1 AND 10000000
+SELECT coalesce(pm.person, d.user_id) AS person, d.ts,
+       CASE WHEN d.t = 2 THEN d.price ELSE 0 END AS price, d.prod
+FROM dedup d
+LEFT JOIN pmap pm ON pm.id = d.user_id
+WHERE d.user_id IS NOT NULL AND d.ts >= {WS} AND d.ts < {WE} AND d.t > 0
+  AND (d.t = 1 OR d.price BETWEEN 1 AND 10000000)
+  AND d.ing - d.ts <= {DAY_MS}
 """)
 stage("dedup/validate events")
-con.execute("DROP TABLE ev_raw; DROP TABLE ev_typed; DROP TABLE dup_ids")
+con.execute("DROP TABLE ev_raw; DROP TABLE dup_ids")
 
 # ---------------------------------------------------------------- clicks
 con.execute(f"""
 CREATE TABLE ck AS
 SELECT coalesce(pm.person, c.user_id) AS person, c.ts, c.click_id, c.campaign_id
-FROM (
-    SELECT click_id, user_id, campaign_id, parse_ts(ts) AS ts FROM ck_raw
-    WHERE click_id IS NOT NULL AND user_id IS NOT NULL
-      AND campaign_id IN (SELECT campaign_id FROM campaigns)
-) c
+FROM ck_raw c
 LEFT JOIN pmap pm ON pm.id = c.user_id
 WHERE c.ts >= {WS - WEEK_MS} AND c.ts < {WE}
 """)
@@ -329,37 +329,56 @@ WHERE c.ts >= {WS - WEEK_MS} AND c.ts < {WE}
 stage("validate clicks")
 con.execute("DROP TABLE ck_raw")
 
+# Sessionize with one sort.  Ordered by (ts, rowid), only the first event of a
+# group of equal ts can see a gap over 30 min (the rest see 0), so ties always
+# share a session.  st holds each session's first event: its ts (the start),
+# its row number rn and the person's event count; a session's events are the
+# rows from its rn to the next start's rn.  Only purchases (~3%) need to be
+# placed in their session explicitly: the latest start <= their ts.
 con.execute(f"""
-CREATE TABLE evs AS
--- Both windows order by (ts, rowid): one total order, so equal timestamps get
--- the same treatment in each pass.  Only the first of a group of equal ts can
--- see a gap (the rest see 0), so ties always share a session.
-SELECT person, is_p, price, category,
-       max(CASE WHEN prev IS NULL OR ts - prev > {GAP_MS} THEN ts END)
-           OVER (PARTITION BY person ORDER BY ts, rid ROWS UNBOUNDED PRECEDING) AS start
-FROM (SELECT *, rowid AS rid, lag(ts) OVER (PARTITION BY person ORDER BY ts, rowid) AS prev FROM ev)
+CREATE TABLE st AS
+SELECT person, ts AS start, rn, cnt FROM (
+    SELECT person, ts, lag(ts) OVER w AS prev, row_number() OVER w AS rn,
+           count(*) OVER (PARTITION BY person) AS cnt
+    FROM ev WINDOW w AS (PARTITION BY person ORDER BY ts, rowid)
+) WHERE prev IS NULL OR ts - prev > {GAP_MS}
 """)
-log("  evs (windows)")
+log("  st (session starts)")
+con.execute("""
+CREATE TABLE pp AS
+SELECT s.person, s.start, e.price, e.prod
+FROM (SELECT person, ts, price, prod FROM ev WHERE prod IS NOT NULL) e
+ASOF JOIN st s ON e.person = s.person AND e.ts >= s.start
+""")
+log("  pp (purchases in sessions)")
 con.execute(f"""
 CREATE TABLE sess AS
-SELECT person, start, (DATE '1970-01-01' + (start // {DAY_MS})::INTEGER) AS day,
-       count(*) AS n_events, sum(price) AS revenue, bool_or(is_p) AS has_p
-FROM evs GROUP BY person, start
+WITH n AS (
+    SELECT person, start,
+           coalesce(lead(rn) OVER (PARTITION BY person ORDER BY start), cnt + 1) - rn AS n_events
+    FROM st
+), r AS (
+    SELECT person, start, sum(price) AS revenue FROM pp GROUP BY person, start
+)
+SELECT n.person, n.start, (DATE '1970-01-01' + (n.start // {DAY_MS})::INTEGER) AS day, n.n_events,
+       coalesce(r.revenue, 0) AS revenue, r.revenue IS NOT NULL AS has_p
+FROM n LEFT JOIN r USING (person, start)
 """)
 log("  sess")
 stage("sessionize")
-con.execute("DROP TABLE ev")
+con.execute("DROP TABLE ev; DROP TABLE st")
 
-con.execute("""
+con.execute(f"""
 CREATE TABLE user_daily AS
 WITH base AS (
     SELECT person AS user_id, day, count(*) AS sessions, sum(n_events) AS events,
            sum(revenue) AS revenue_cents
     FROM sess GROUP BY ALL
 ), cat AS (
-    SELECT e.person AS user_id, s.day, e.category, sum(e.price) AS rev
-    FROM evs e JOIN sess s ON e.person = s.person AND e.start = s.start
-    WHERE e.is_p GROUP BY ALL
+    SELECT pp.person AS user_id, (DATE '1970-01-01' + (pp.start // {DAY_MS})::INTEGER) AS day,
+           coalesce(p.category, 'unknown') AS category, sum(pp.price) AS rev
+    FROM pp LEFT JOIN products p ON p.product_id = pp.prod
+    GROUP BY ALL
 ), top AS (
     SELECT user_id, day, arg_min(category, (-rev, category)) AS top_category
     FROM cat GROUP BY ALL
@@ -369,7 +388,7 @@ SELECT b.user_id, b.day, b.sessions::BIGINT AS sessions, b.events::BIGINT AS eve
 FROM base b LEFT JOIN top t USING (user_id, day)
 """)
 stage("aggregate user_daily")
-con.execute("DROP TABLE evs")
+con.execute("DROP TABLE pp")
 
 
 # Credit: latest click at or before the start (ties: smallest click_id), within 7 days.
