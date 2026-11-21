@@ -427,7 +427,14 @@ fn map_file(p: &Path) -> S {
     if len == 0 {
         return &[];
     }
-    let m = unsafe { memmap2::Mmap::map(&f) }.unwrap_or_else(|e| panic!("mmap {}: {e}", p.display()));
+    // Linux: MAP_POPULATE reads the whole file in at map time (the files are
+    // mapped in parallel), so the parse never stops on a page fault. On the
+    // Linux test bed this made cold-cache runs as fast as warm ones.
+    #[cfg(target_os = "linux")]
+    let m = unsafe { memmap2::MmapOptions::new().populate().map(&f) };
+    #[cfg(not(target_os = "linux"))]
+    let m = unsafe { memmap2::Mmap::map(&f) };
+    let m = m.unwrap_or_else(|e| panic!("mmap {}: {e}", p.display()));
     let m: &'static memmap2::Mmap = Box::leak(Box::new(m));
     &m[..]
 }
@@ -440,17 +447,34 @@ fn body(data: S) -> S {
     }
 }
 
-fn cut_chunks(body: S, kind: Kind, out: &mut Vec<(Kind, S)>) {
+/// A chunk is a plain byte range [a, b) of a file body, cut without reading
+/// the data; it owns the lines that *start* inside it (see lines_of).
+#[derive(Clone, Copy)]
+struct Chunk {
+    kind: Kind,
+    body: S,
+    a: usize,
+    b: usize,
+}
+
+fn cut_chunks(body: S, kind: Kind, out: &mut Vec<Chunk>) {
     let n = body.len();
-    let mut p = 0;
-    while p < n {
-        let mut e = (p + CHUNK).min(n);
-        if e < n {
-            e = memchr(b'\n', &body[e..]).map_or(n, |i| e + i + 1);
-        }
-        out.push((kind, &body[p..e]));
-        p = e;
+    let mut a = 0;
+    while a < n {
+        let b = (a + CHUNK).min(n);
+        out.push(Chunk { kind, body, a, b });
+        a = b;
     }
+}
+
+/// The whole lines starting in [c.a, c.b): from the first line start >= a to
+/// the first line start >= b (line starts are 0 and every position after a
+/// '\n'). Consecutive chunks therefore partition the body's lines exactly.
+fn lines_of(c: &Chunk) -> S {
+    let (body, n) = (c.body, c.body.len());
+    let start_at = |x: usize| if x == 0 { 0 } else if x >= n { n } else { memchr(b'\n', &body[x - 1..]).map_or(n, |i| x + i) };
+    let (s, e) = (start_at(c.a), start_at(c.b));
+    if s < e { &body[s..e] } else { &[] }
 }
 
 // ------------------------------------------------------------------ parse stage
@@ -1006,13 +1030,22 @@ fn main() {
     let ncamp = camp_names.len();
 
     // chunks
-    let mut chunks: Vec<(Kind, S)> = Vec::new();
+    let mut paths: Vec<(PathBuf, Kind)> = Vec::new();
     for (sub, kind) in [("events", Kind::Ev), ("clicks", Kind::Ck), ("links", Kind::Lk)] {
-        for p in csv_files(&data.join(sub)) {
-            cut_chunks(body(map_file(&p)), kind, &mut chunks);
-        }
+        paths.extend(csv_files(&data.join(sub)).into_iter().map(|p| (p, kind)));
     }
-    chunks.sort_by_key(|&(_, c)| std::cmp::Reverse(c.len()));
+    let datas: Vec<S> = paths.par_iter().map(|(p, _)| map_file(p)).collect();
+    // byte ranges only: no data is read here (workers find their line ends)
+    let mut chunks: Vec<Chunk> = datas
+        .par_iter()
+        .zip(&paths)
+        .flat_map_iter(|(&d, &(_, kind))| {
+            let mut v = Vec::new();
+            cut_chunks(body(d), kind, &mut v);
+            v
+        })
+        .collect();
+    chunks.sort_by_key(|c| std::cmp::Reverse(c.b - c.a));
     tm.stage("setup/lookups");
 
     // ---------------------------------------------------------- 1. parse
@@ -1021,11 +1054,11 @@ fn main() {
     // lines (~65 bytes each). The table takes up to lines/8 IDs (its limit is
     // half its slots); past that, threads fall back to local maps (still exact).
     // Every slot page gets touched, so oversizing costs real memory.
-    let total_bytes: usize = chunks.iter().map(|c| c.1.len()).sum();
+    let total_bytes: usize = chunks.iter().map(|c| c.b - c.a).sum();
     let shared = SharedTab::new((total_bytes / 65 / 4).next_power_of_two().clamp(1 << 16, 1 << 30));
     // Row buffers sized from the event bytes (lines are ~70 bytes; this assumes
     // 55, plus slack for partly used blocks); overflow keeps it exact anyway.
-    let ev_bytes: usize = chunks.iter().filter(|c| c.0 == Kind::Ev).map(|c| c.1.len()).sum();
+    let ev_bytes: usize = chunks.iter().filter(|c| c.kind == Kind::Ev).map(|c| c.b - c.a).sum();
     let per_shard = ev_bytes / 55 / NSHARD + BLK * nthreads * 2 + 1024;
     let bufs: Vec<RowBuf> = (0..NSHARD).map(|_| RowBuf::new(per_shard)).collect();
     let next = AtomicUsize::new(0);
@@ -1054,8 +1087,9 @@ fn main() {
                     };
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&(kind, c)) = chunks.get(i) else { break };
-                        match kind {
+                        let Some(ch) = chunks.get(i) else { break };
+                        let c = lines_of(ch);
+                        match ch.kind {
                             Kind::Ev => for_records(c, |f| w.event(f)),
                             Kind::Ck => for_records(c, |f| w.click(f)),
                             Kind::Lk => for_records(c, |f| w.link(f)),
@@ -1557,6 +1591,38 @@ mod tests {
         assert_eq!(fast::<N>(all), reference::<N>(all));
         let trimmed = &all[..all.len() - 1]; // last line without '\n'
         assert_eq!(fast::<N>(trimmed), reference::<N>(trimmed));
+    }
+
+    #[test]
+    fn chunks_partition_lines() {
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        for len in 0..300usize {
+            for step in 1..24usize {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                let density = (x % 5) as u64 + 1;
+                let body: Vec<u8> = (0..len)
+                    .map(|i| {
+                        let r = (x.wrapping_mul(i as u64 + 1) >> 33) % 7;
+                        if r < density { b'\n' } else { b'a' }
+                    })
+                    .collect();
+                let body = leak(body);
+                let mut whole = Vec::new();
+                let mut a = 0;
+                while a < len {
+                    let b = (a + step).min(len);
+                    let part = lines_of(&Chunk { kind: Kind::Ev, body, a, b });
+                    // each part is whole lines: empty, or starts at a line start
+                    let off = part.as_ptr() as usize - body.as_ptr() as usize;
+                    assert!(part.is_empty() || off == 0 || body[off - 1] == b'\n');
+                    whole.extend_from_slice(part);
+                    a = b;
+                }
+                assert_eq!(whole, body, "len={len} step={step}");
+            }
+        }
     }
 
     #[test]
