@@ -322,6 +322,13 @@ fn pack(s: &[u8]) -> (u64, u64) {
     (u64::from_le_bytes(b[..8].try_into().unwrap()), u64::from_le_bytes(b[8..].try_into().unwrap()))
 }
 
+/// 64-bit mix of a packed ID (low bits index tables, high bits pick partitions).
+#[inline]
+fn mix(lo: u64, hi: u64) -> u64 {
+    let h = (lo ^ hi.wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    h ^ (h >> 29)
+}
+
 #[derive(Clone, Copy, Default)]
 struct Slot {
     lo: u64,
@@ -343,8 +350,7 @@ impl IdTable {
     }
     #[inline]
     fn slot_of(&self, lo: u64, hi: u64) -> usize {
-        let h = (lo ^ hi.wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_mul(0xD6E8_FEB8_6659_FD93);
-        ((h ^ (h >> 29)) as usize) & self.mask
+        (mix(lo, hi) as usize) & self.mask
     }
     fn grow(&mut self) {
         let old = std::mem::replace(&mut self.slots, vec![Slot::default(); (self.mask + 1) * 2]);
@@ -717,15 +723,24 @@ fn main() {
     tm.stage("read/parse csv");
 
     // ---------------------------------------------------------- 2. global IDs
-    // Sort every (thread, local id) key once, with a 16-byte big-endian prefix
-    // inline so most comparisons never touch the string; one scan then gives
-    // each distinct ID its byte-wise rank.
+    // Every thread saw nearly every ID, so first dedup across threads: hash-
+    // partition all (thread, local id) keys, dedup each partition with a small
+    // cache-resident table, then sort only the distinct IDs to get byte-wise
+    // ranks and write each (thread, local id)'s rank back.
+    const NPART: usize = 256;
+    #[derive(Clone, Copy)]
+    struct E {
+        lo: u64,
+        hi: u64, // 0: a long ID, lo = its hash; compare by string
+        t: u32,
+        l: u32,
+    }
     #[derive(Clone, Copy)]
     struct K {
         pre: u128,
         s: S,
-        t: u32,
-        l: u32,
+        p: u32,
+        d: u32,
     }
     #[inline]
     fn prefix(s: S) -> u128 {
@@ -734,23 +749,65 @@ fn main() {
         b[..n].copy_from_slice(&s[..n]);
         u128::from_be_bytes(b)
     }
-    let mut ks: Vec<K> = outs
+    let kh = hasher();
+    let buckets: Vec<Vec<Vec<E>>> = outs
         .par_iter()
         .enumerate()
-        .flat_map_iter(|(t, o)| {
-            o.keys.iter().enumerate().map(move |(l, &s)| K { pre: prefix(s), s, t: t as u32, l: l as u32 })
+        .map(|(t, o)| {
+            let mut b: Vec<Vec<E>> = (0..NPART).map(|_| Vec::with_capacity(o.keys.len() / NPART * 5 / 4 + 16)).collect();
+            for (l, &s) in o.keys.iter().enumerate() {
+                let (lo, hi) = if s.len() <= 15 { pack(s) } else { (kh.hash_one(s), 0) };
+                b[(mix(lo, hi) >> 56) as usize].push(E { lo, hi, t: t as u32, l: l as u32 });
+            }
+            b
         })
         .collect();
+    let rank_at: Vec<Vec<std::sync::atomic::AtomicU32>> =
+        outs.iter().map(|o| (0..o.keys.len()).map(|_| std::sync::atomic::AtomicU32::new(0)).collect()).collect();
+    // per partition: distinct IDs, and the (t, l) -> partition-local index map
+    let parts: Vec<(Vec<S>, Vec<(u32, u32, u32)>)> = (0..NPART)
+        .into_par_iter()
+        .map(|p| {
+            let n: usize = buckets.iter().map(|b| b[p].len()).sum();
+            let mut tab = IdTable::new((n * 2).next_power_of_two().max(16));
+            let mut long: HashMap<S, u32, Hs> = HashMap::with_hasher(hasher());
+            let mut uniq: Vec<S> = Vec::new();
+            let mut codes = Vec::with_capacity(n);
+            for b in &buckets {
+                for e in &b[p] {
+                    let s = outs[e.t as usize].keys[e.l as usize];
+                    let new_id = || {
+                        uniq.push(s);
+                        (uniq.len() - 1) as u32
+                    };
+                    let d = if e.hi != 0 { tab.get_or_insert(e.lo, e.hi, new_id) } else { *long.entry(s).or_insert_with(new_id) };
+                    codes.push((e.t, e.l, d));
+                }
+            }
+            (uniq, codes)
+        })
+        .collect();
+    drop(buckets);
+    let mut ks: Vec<K> = parts
+        .par_iter()
+        .enumerate()
+        .flat_map_iter(|(p, (uniq, _))| uniq.iter().enumerate().map(move |(d, &s)| K { pre: prefix(s), s, p: p as u32, d: d as u32 }))
+        .collect();
     ks.par_sort_unstable_by(|a, b| a.pre.cmp(&b.pre).then_with(|| a.s.cmp(b.s)));
-    let mut rank: Vec<Vec<u32>> = outs.iter().map(|o| vec![0u32; o.keys.len()]).collect();
-    let mut names: Vec<S> = Vec::new();
-    for (i, k) in ks.iter().enumerate() {
-        if i == 0 || k.pre != ks[i - 1].pre || k.s != ks[i - 1].s {
-            names.push(k.s);
-        }
-        rank[k.t as usize][k.l as usize] = (names.len() - 1) as u32;
+    let names: Vec<S> = ks.iter().map(|k| k.s).collect();
+    let mut rank_pd: Vec<Vec<u32>> = parts.iter().map(|(u, _)| vec![0u32; u.len()]).collect();
+    for (r, k) in ks.iter().enumerate() {
+        rank_pd[k.p as usize][k.d as usize] = r as u32;
     }
     drop(ks);
+    parts.par_iter().zip(&rank_pd).for_each(|((_, codes), rp)| {
+        for &(t, l, d) in codes {
+            rank_at[t as usize][l as usize].store(rp[d as usize], Ordering::Relaxed);
+        }
+    });
+    drop(parts);
+    let rank: Vec<Vec<u32>> =
+        rank_at.into_par_iter().map(|v| v.into_iter().map(|a| a.into_inner()).collect()).collect();
     let nids = names.len();
     if std::env::var_os("VERBOSE").is_some() {
         eprintln!("ids: {} thread-local keys, {} distinct", outs.iter().map(|o| o.keys.len()).sum::<usize>(), nids);
