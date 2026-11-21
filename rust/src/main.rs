@@ -432,6 +432,35 @@ fn map_file(p: &Path) -> S {
     &m[..]
 }
 
+/// Reads whole files into leaked, preallocated buffers with parallel preads:
+/// every file is split into 4 MB ranges and the ranges of all files are read
+/// concurrently across the thread pool. No mmap: the parse then runs on plain
+/// memory and never takes a file page fault.
+fn read_files(paths: &[PathBuf]) -> Vec<S> {
+    use std::os::unix::fs::FileExt;
+    const PIECE: usize = 4 << 20;
+    let files: Vec<File> =
+        paths.iter().map(|p| File::open(p).unwrap_or_else(|e| panic!("open {}: {e}", p.display()))).collect();
+    let mut bufs: Vec<&'static mut [u8]> = Vec::with_capacity(files.len());
+    for f in &files {
+        let len = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
+        bufs.push(Box::leak(vec![0u8; len].into_boxed_slice()));
+    }
+    let views: Vec<(*const u8, usize)> = bufs.iter().map(|b| (b.as_ptr(), b.len())).collect();
+    let mut jobs: Vec<(usize, u64, &mut [u8])> = Vec::new();
+    for (i, b) in bufs.iter_mut().enumerate() {
+        for (k, piece) in b.chunks_mut(PIECE).enumerate() {
+            jobs.push((i, (k * PIECE) as u64, piece));
+        }
+    }
+    jobs.into_par_iter().for_each(|(i, off, piece)| {
+        files[i].read_exact_at(piece, off).unwrap_or_else(|e| panic!("read {}: {e}", paths[i].display()));
+    });
+    drop(bufs);
+    // Every range is written and no &mut is left: hand out shared 'static views.
+    views.into_iter().map(|(p, n)| unsafe { std::slice::from_raw_parts(p, n) }).collect()
+}
+
 /// Everything after the header line.
 fn body(data: S) -> S {
     match memchr(b'\n', data) {
@@ -959,11 +988,15 @@ fn main() {
     let ncamp = camp_names.len();
 
     // chunks
-    let mut chunks: Vec<(Kind, S)> = Vec::new();
+    let mut paths: Vec<(PathBuf, Kind)> = Vec::new();
     for (sub, kind) in [("events", Kind::Ev), ("clicks", Kind::Ck), ("links", Kind::Lk)] {
-        for p in csv_files(&data.join(sub)) {
-            cut_chunks(body(map_file(&p)), kind, &mut chunks);
-        }
+        paths.extend(csv_files(&data.join(sub)).into_iter().map(|p| (p, kind)));
+    }
+    let datas = read_files(&paths.iter().map(|p| p.0.clone()).collect::<Vec<_>>());
+    tm.stage("read files (pread)");
+    let mut chunks: Vec<(Kind, S)> = Vec::new();
+    for (data, &(_, kind)) in datas.into_iter().zip(&paths) {
+        cut_chunks(body(data), kind, &mut chunks);
     }
     chunks.sort_by_key(|&(_, c)| std::cmp::Reverse(c.len()));
     tm.stage("setup/lookups");
