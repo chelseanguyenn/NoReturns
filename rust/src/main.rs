@@ -611,7 +611,21 @@ struct Worker<'a> {
     shared: &'a SharedTab,
     map: HashMap<S, u32, Hs>, // fallback: long IDs, or the shared table at its limit
     out: Out,
+    pend: Vec<Pend>, // user IDs waiting to be interned, in batches
 }
+
+/// A deferred user-ID lookup and the row field it fills.
+#[derive(Clone, Copy)]
+struct Pend {
+    lo: u64,
+    hi: u64,
+    key: S,
+    at: u32, // EV_AT | shard, or CK_AT
+    ix: u32, // row index in that vector
+}
+const EV_AT: u32 = 1 << 31;
+const CK_AT: u32 = 0;
+const BATCH: usize = 32;
 
 impl<'a> Worker<'a> {
     #[inline]
@@ -624,12 +638,48 @@ impl<'a> Worker<'a> {
                 return g;
             }
         }
+        self.intern_local(k)
+    }
+
+    /// The fallback path of intern (long IDs, or the shared table full).
+    fn intern_local(&mut self, k: S) -> u32 {
         let keys = &mut self.out.keys;
         LOCAL
             | *self.map.entry(k).or_insert_with(|| {
                 keys.push(k);
                 (keys.len() - 1) as u32
             })
+    }
+
+    /// Resolves the pending lookups back to back: they are independent, so
+    /// their cache misses overlap instead of stalling each row in turn.
+    #[inline(never)]
+    fn flush(&mut self) {
+        let pend = std::mem::take(&mut self.pend);
+        for p in &pend {
+            let new_keys = &mut self.out.new_keys;
+            let key = p.key;
+            let u = match self.shared.get_or_insert(p.lo, p.hi, |g| new_keys.push((g, key))) {
+                Some(g) => g,
+                None => self.intern_local(key),
+            };
+            if p.at & EV_AT != 0 {
+                self.out.ev[(p.at & !EV_AT) as usize][p.ix as usize].user = u;
+            } else {
+                self.out.ck[p.ix as usize].user = u;
+            }
+        }
+        self.pend = pend;
+        self.pend.clear();
+    }
+
+    #[inline]
+    fn defer(&mut self, key: S, at: u32, ix: u32) {
+        let (lo, hi) = pack(key);
+        self.pend.push(Pend { lo, hi, key, at, ix });
+        if self.pend.len() == BATCH {
+            self.flush();
+        }
     }
 
     fn event(&mut self, f: &[S; 7]) {
@@ -662,11 +712,20 @@ impl<'a> Worker<'a> {
             row.ts = (t - c.ws) as u32;
             row.price = p;
             row.cat = *c.products.get(pid).unwrap_or(&c.unknown);
+        }
+        // user IDs of short-event_id rows are interned in batches (see flush)
+        let defer_user = row.valid && uid.len() <= 15 && eid.len() <= 15;
+        if row.valid && !defer_user {
             row.user = self.intern(uid);
         }
         if eid.len() <= 15 {
             (row.lo, row.hi) = pack(eid);
-            self.out.ev[(mix(row.lo, row.hi) >> 56) as usize].push(row);
+            let shard = (mix(row.lo, row.hi) >> 56) as usize;
+            self.out.ev[shard].push(row);
+            if defer_user {
+                let ix = (self.out.ev[shard].len() - 1) as u32;
+                self.defer(uid, EV_AT | shard as u32, ix);
+            }
         } else {
             self.out.ev_long.push((eid, row));
         }
@@ -683,8 +742,14 @@ impl<'a> Worker<'a> {
             return;
         }
         let Some(&camp) = c.campaigns.get(camp) else { return };
-        let user = self.intern(uid);
-        self.out.ck.push(CkRow { cid, ts: t, user, camp });
+        if uid.len() <= 15 {
+            self.out.ck.push(CkRow { cid, ts: t, user: 0, camp });
+            let ix = (self.out.ck.len() - 1) as u32;
+            self.defer(uid, CK_AT, ix);
+        } else {
+            let user = self.intern(uid);
+            self.out.ck.push(CkRow { cid, ts: t, user, camp });
+        }
     }
 
     fn link(&mut self, f: &[S; 2]) {
@@ -920,6 +985,7 @@ fn main() {
                         tid: t as u8,
                         tsp: TsParser::new(),
                         shared,
+                        pend: Vec::with_capacity(BATCH),
                         map: HashMap::with_hasher(hasher()),
                         out: Out {
                             ev: (0..NSHARD).map(|_| Vec::new()).collect(),
@@ -939,6 +1005,7 @@ fn main() {
                             Kind::Lk => for_records(c, |f| w.link(f)),
                         }
                     }
+                    w.flush();
                     w.out
                 })
             })
