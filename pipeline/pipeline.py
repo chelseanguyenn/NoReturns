@@ -14,6 +14,7 @@ import glob
 import json
 import os
 import shutil
+import sys
 import time
 
 import duckdb
@@ -30,7 +31,17 @@ T0 = time.time()
 
 def log(msg):
     if VERBOSE:
-        print(f"[{time.time() - T0:6.2f}s] {msg}", flush=True)
+        print(f"[{time.time() - T0:6.2f}s] {msg}", file=sys.stderr, flush=True)
+
+
+_last = [T0]
+
+
+def stage(name):
+    """Always print the time spent since the previous stage to stderr."""
+    now = time.time()
+    print(f"[timing] {name:<26} {now - _last[0]:7.2f}s   total {now - T0:7.2f}s", file=sys.stderr, flush=True)
+    _last[0] = now
 
 
 try:
@@ -167,13 +178,16 @@ def load_table(name, files, cols):
 
 
 # ---------------------------------------------------------------- inputs
+stage("setup")
 load_table("products", [os.path.join(DATA, "products.csv")], ["product_id", "category"])
 load_table("campaigns", [os.path.join(DATA, "campaigns.csv")], ["campaign_id", "channel"])
 load_table("links_raw", csv_files("links"), ["a", "b"])
+stage("read/parse links+lookups")
 load_table("ev_raw", csv_files("events"),
            ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"])
+stage("read/parse events")
 load_table("ck_raw", csv_files("clicks"), ["click_id", "user_id", "campaign_id", "ts"])
-log("loaded raw tables")
+stage("read/parse clicks")
 
 # ---------------------------------------------------------------- linked IDs
 con.execute("""
@@ -185,10 +199,12 @@ SELECT id, (row_number() OVER (ORDER BY id) - 1)::INTEGER AS ix
 FROM (SELECT a AS id FROM lk UNION SELECT b FROM lk)
 """)
 n_ids = con.execute("SELECT count(*) FROM lid").fetchone()[0]
+log(f"lk/lid built: {n_ids} ids")
 edges = con.execute("""
 SELECT la.ix, lb.ix FROM lk JOIN lid la ON lk.a = la.id JOIN lid lb ON lk.b = lb.id
 """).fetchall()
 
+log(f"fetched {len(edges)} edges")
 # Union-find; the root of each set is its smallest index = byte-wise smallest ID.
 parent = list(range(n_ids))
 for x, y in edges:
@@ -207,14 +223,27 @@ for i in range(n_ids):
 del edges
 log(f"union-find over {n_ids} linked ids")
 
-con.execute("CREATE TABLE lroot AS SELECT unnest(range(?::INTEGER)) AS ix, unnest(?::INTEGER[]) AS r",
-            [n_ids, parent])
+# Hand the non-root (ix, root) pairs back to DuckDB through a scratch file of
+# plain integers.  Binding the list as a query parameter is fine on some
+# builds but took 40 s for 1.2M ids in the python:3.12 image.
+lroot_path = os.path.join(SCRATCH, "lroot.csv")
+with open(lroot_path, "w") as fh:
+    fh.write("".join(f"{i},{r}\n" for i, r in enumerate(parent) if i != r))
+con.execute(f"""
+CREATE TABLE lroot AS SELECT * FROM read_csv('{lroot_path}', columns={{'ix': 'INTEGER', 'r': 'INTEGER'}},
+                                             header=false, auto_detect=false)
+""")
+os.remove(lroot_path)
+log("lroot built")
 con.execute("""
 CREATE TABLE pmap AS
 SELECT l.id, n.id AS person FROM lid l JOIN lroot USING (ix) JOIN lid n ON n.ix = lroot.r
-WHERE l.id <> n.id
 """)
 del parent
+# Drop each intermediate table once nothing later reads it, so DuckDB frees
+# its memory instead of spilling it to scratch.
+con.execute("DROP TABLE links_raw; DROP TABLE lk; DROP TABLE lid; DROP TABLE lroot")
+stage("links (union-find)")
 
 # ---------------------------------------------------------------- events
 # Dedup: only the few event_ids seen more than once need the arg_min; the rest
@@ -263,7 +292,24 @@ LEFT JOIN pmap pm ON pm.id = v.user_id
 LEFT JOIN products p ON p.product_id = v.product_id
 WHERE v.event_type <> 'purchase' OR v.price BETWEEN 1 AND 10000000
 """)
-log("events validated")
+stage("dedup/validate events")
+con.execute("DROP TABLE ev_raw; DROP TABLE ev_typed; DROP TABLE dup_ids")
+
+# ---------------------------------------------------------------- clicks
+con.execute(f"""
+CREATE TABLE ck AS
+SELECT coalesce(pm.person, c.user_id) AS person, c.ts, c.click_id, c.campaign_id
+FROM (
+    SELECT click_id, user_id, campaign_id, parse_ts(ts) AS ts FROM ck_raw
+    WHERE click_id IS NOT NULL AND user_id IS NOT NULL
+      AND campaign_id IN (SELECT campaign_id FROM campaigns)
+) c
+LEFT JOIN pmap pm ON pm.id = c.user_id
+WHERE c.ts >= {WS - WEEK_MS} AND c.ts < {WE}
+""")
+
+stage("validate clicks")
+con.execute("DROP TABLE ck_raw")
 
 con.execute(f"""
 CREATE TABLE evs AS
@@ -281,7 +327,8 @@ SELECT person, start, (DATE '1970-01-01' + (start // {DAY_MS})::INTEGER) AS day,
        count(*) AS n_events, sum(price) AS revenue, bool_or(is_p) AS has_p
 FROM evs GROUP BY person, start
 """)
-log("sessionized")
+stage("sessionize")
+con.execute("DROP TABLE ev")
 
 con.execute("""
 CREATE TABLE user_daily AS
@@ -301,20 +348,9 @@ SELECT b.user_id, b.day, b.sessions::BIGINT AS sessions, b.events::BIGINT AS eve
        b.revenue_cents::BIGINT AS revenue_cents, t.top_category
 FROM base b LEFT JOIN top t USING (user_id, day)
 """)
-log("user_daily")
+stage("aggregate user_daily")
+con.execute("DROP TABLE evs")
 
-# ---------------------------------------------------------------- clicks
-con.execute(f"""
-CREATE TABLE ck AS
-SELECT coalesce(pm.person, c.user_id) AS person, c.ts, c.click_id, c.campaign_id
-FROM (
-    SELECT click_id, user_id, campaign_id, parse_ts(ts) AS ts FROM ck_raw
-    WHERE click_id IS NOT NULL AND user_id IS NOT NULL
-      AND campaign_id IN (SELECT campaign_id FROM campaigns)
-) c
-LEFT JOIN pmap pm ON pm.id = c.user_id
-WHERE c.ts >= {WS - WEEK_MS} AND c.ts < {WE}
-""")
 
 # Credit: latest click at or before the start (ties: smallest click_id), within 7 days.
 con.execute(f"""
@@ -328,6 +364,7 @@ SELECT s.person, s.start, s.day, s.revenue, s.has_p,
            AS campaign_id
 FROM sess s ASOF LEFT JOIN best b ON s.person = b.person AND s.start >= b.ts
 """)
+stage("attribution (credit)")
 
 # Assists: per (person, campaign), merge click times into intervals [a, b + 7d];
 # a session is assisted iff its start lies in one of them.  Locate the covered
@@ -360,6 +397,7 @@ FROM rng JOIN runs r ON rng.person = r.person AND r.dlo <= rng.hi AND r.dhi >= r
 WHERE rng.lo <= rng.hi
 GROUP BY ALL
 """)
+stage("assists")
 
 con.execute("""
 CREATE TABLE campaign_daily AS
@@ -378,7 +416,7 @@ SELECT campaign_id,
 FROM cr FULL OUTER JOIN assist a USING (campaign_id, day)
 LEFT JOIN campaigns c USING (campaign_id)
 """)
-log("campaign_daily")
+stage("aggregate campaign_daily")
 
 # ---------------------------------------------------------------- outputs
 for table in ("user_daily", "campaign_daily"):
@@ -387,4 +425,4 @@ for table in ("user_daily", "campaign_daily"):
         shutil.rmtree(d)
     os.makedirs(d, exist_ok=True)
     con.execute(f"COPY {table} TO '{os.path.join(d, 'part-0.parquet')}' (FORMAT parquet)")
-log("written")
+stage("write parquet")
