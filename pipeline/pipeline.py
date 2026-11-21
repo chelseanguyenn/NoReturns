@@ -18,6 +18,7 @@ import sys
 import time
 
 import duckdb
+import numpy as np
 
 DATA = os.environ.get("DATA_DIR", "/data")
 OUT = os.environ.get("OUTPUT_DIR", "/output")
@@ -200,50 +201,56 @@ FROM (SELECT a AS id FROM lk UNION SELECT b FROM lk)
 """)
 n_ids = con.execute("SELECT count(*) FROM lid").fetchone()[0]
 log(f"lk/lid built: {n_ids} ids")
-edges = con.execute("""
-SELECT la.ix, lb.ix FROM lk JOIN lid la ON lk.a = la.id JOIN lid lb ON lk.b = lb.id
-""").fetchall()
+e = con.execute("""
+SELECT la.ix AS u, lb.ix AS v FROM lk JOIN lid la ON lk.a = la.id JOIN lid lb ON lk.b = lb.id
+""").fetchnumpy()
+U = np.asarray(e["u"], dtype=np.int64)
+V = np.asarray(e["v"], dtype=np.int64)
+del e
+log(f"fetched {len(U)} edges")
 
-log(f"fetched {len(edges)} edges")
-# Union-find; the root of each set is its smallest index = byte-wise smallest ID.
-parent = list(range(n_ids))
-for x, y in edges:
-    while parent[x] != x:
-        parent[x] = parent[parent[x]]
-        x = parent[x]
-    while parent[y] != y:
-        parent[y] = parent[parent[y]]
-        y = parent[y]
-    if x < y:
-        parent[y] = x
-    elif y < x:
-        parent[x] = y
-for i in range(n_ids):
-    parent[i] = parent[parent[i]]  # parents always have smaller index: one pass suffices
-del edges
-log(f"union-find over {n_ids} linked ids")
+# Connected components, vectorized: hook + pointer jumping (Shiloach-Vishkin
+# style).  Invariants: L[x] <= x and L[x] is in x's component.  Each round
+# first jumps L to a fixpoint (every L[x] is a root, L[r] == r), then hooks
+# every root touched by an edge onto the smaller of the edge's two roots.
+# At the fixpoint every edge has equal labels, so each component carries one
+# label; its smallest member m has L[m] == m, so that label is m: the
+# byte-wise smallest ID, since ix follows ORDER BY id.  Long chains converge
+# in O(log length) rounds because both steps move labels many links at once.
+L = np.arange(n_ids, dtype=np.int64)
+rounds = 0
+while True:
+    while True:
+        L2 = L[L]
+        if np.array_equal(L2, L):
+            break
+        L = L2
+    lu, lv = L[U], L[V]
+    diff = lu != lv
+    if not diff.any():
+        break
+    lu, lv = lu[diff], lv[diff]
+    m = np.minimum(lu, lv)
+    np.minimum.at(L, lu, m)
+    np.minimum.at(L, lv, m)
+    rounds += 1
+del U, V
+log(f"components over {n_ids} linked ids in {rounds} rounds")
 
-# Hand the non-root (ix, root) pairs back to DuckDB through a scratch file of
-# plain integers.  Binding the list as a query parameter is fine on some
-# builds but took 40 s for 1.2M ids in the python:3.12 image.
-lroot_path = os.path.join(SCRATCH, "lroot.csv")
-with open(lroot_path, "w") as fh:
-    fh.write("".join(f"{i},{r}\n" for i, r in enumerate(parent) if i != r))
-con.execute(f"""
-CREATE TABLE lroot AS SELECT * FROM read_csv('{lroot_path}', columns={{'ix': 'INTEGER', 'r': 'INTEGER'}},
-                                             header=false, auto_detect=false)
-""")
-os.remove(lroot_path)
-log("lroot built")
+nonroot = np.nonzero(L != np.arange(n_ids, dtype=np.int64))[0]
+lroot_np = {"ix": nonroot.astype(np.int32), "r": L[nonroot].astype(np.int32)}
+con.register("lroot_np", lroot_np)
+con.execute("CREATE TABLE lroot AS SELECT ix, r FROM lroot_np")
+con.unregister("lroot_np")
+del L, nonroot, lroot_np
 con.execute("""
 CREATE TABLE pmap AS
 SELECT l.id, n.id AS person FROM lid l JOIN lroot USING (ix) JOIN lid n ON n.ix = lroot.r
 """)
-del parent
 # Drop each intermediate table once nothing later reads it, so DuckDB frees
 # its memory instead of spilling it to scratch.
 con.execute("DROP TABLE links_raw; DROP TABLE lk; DROP TABLE lid; DROP TABLE lroot")
-stage("links (union-find)")
+stage("links (components)")
 
 # ---------------------------------------------------------------- events
 # Dedup: only the few event_ids seen more than once need the arg_min; the rest
