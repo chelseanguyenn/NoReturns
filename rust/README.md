@@ -9,9 +9,9 @@ A single binary implementing `../rules.md`; output is identical to `pipeline/pip
 - Sessions: events sorted by packed `(person, ts)`; one scan builds sessions and user-days; credit is a binary search over the person's clicks sorted by `(ts, click_id)`; assists come from merged per-campaign click intervals.
 - Output: Parquet via the `parquet` crate (low-level column writers).
 
-Build and check (from the repo root):
+Build and check (from the repo root; the top-level `Dockerfile` builds this crate with the root as context):
 
-    make fixtures CONTEXT=rust IMAGE=shopping-sessions-rust:latest
-    make run-dev  CONTEXT=rust IMAGE=shopping-sessions-rust:latest && make check-dev
+    make fixtures IMAGE=shopping-sessions-rust:latest
+    make run-dev  IMAGE=shopping-sessions-rust:latest && make check-dev
 
 Native: `cd rust && cargo build --release && target/release/sessions DATA_DIR OUTPUT_DIR`. Set `VERBOSE=1` for ID counts; stage timings always go to stderr.

@@ -4,8 +4,6 @@ MEM   ?= 24g
 # The scorer's platform. PLATFORM=linux/arm64 builds and runs natively on an Apple-silicon Mac, for fast local loops.
 PLATFORM ?= linux/amd64
 DEV   ?= dev
-# Build context: . for the DuckDB image, rust for the Rust one (make fixtures CONTEXT=rust).
-CONTEXT ?= .
 # In the monorepo the fixtures live two levels up; the published starter has its own copy.
 FIXTURES ?= $(if $(wildcard fixtures),fixtures,../../fixtures)
 export IMAGE CPUS MEM PLATFORM
@@ -14,7 +12,7 @@ export IMAGE CPUS MEM PLATFORM
 
 ## Build the image for the scorer's platform, linux/amd64 (emulated on Apple silicon)
 build:
-	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE) $(CONTEXT)
+	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE) .
 
 ## Run the image on all 36 edge-case fixtures and diff against the expected tables
 fixtures: build

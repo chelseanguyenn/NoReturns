@@ -226,3 +226,7 @@ dev-answer/
 out/
 __pycache__/
 data/
+
+# Rust build output and run outputs
+rust/target/
+out*/
