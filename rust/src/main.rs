@@ -461,6 +461,35 @@ enum Kind {
     Lk,
 }
 
+/// One preallocated row array per event_id shard, shared by the parse
+/// threads: each reserves blocks of BLK slots with one atomic add and writes
+/// its rows there once. Unused slots of a thread's last blocks are written as
+/// holes (all zero; a real row has hi != 0). Rows that do not fit go to the
+/// thread's overflow vector for that shard.
+struct RowBuf {
+    ptr: *mut EvRow,
+    cap: usize,
+    next: AtomicUsize,
+}
+unsafe impl Sync for RowBuf {}
+unsafe impl Send for RowBuf {}
+const BLK: usize = 128;
+const HOLE: EvRow = EvRow { lo: 0, hi: 0, ing: 0, ts: 0, user: 0, price: 0, cat: 0, valid: false, tid: 0 };
+
+impl RowBuf {
+    fn new(cap: usize) -> Self {
+        let mut v: Vec<EvRow> = Vec::with_capacity(cap); // untouched pages cost nothing
+        let ptr = v.as_mut_ptr();
+        std::mem::forget(v);
+        RowBuf { ptr, cap, next: AtomicUsize::new(0) }
+    }
+    /// The slots written so far (rows and holes). Call only after every writer is done.
+    fn filled(&self) -> &mut [EvRow] {
+        let n = self.next.load(Ordering::Acquire).min(self.cap);
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, n) }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct EvRow {
     lo: u64, // event_id packed exactly (see pack); over 15 bytes: Out::ev_long
@@ -483,7 +512,7 @@ struct CkRow {
 }
 
 struct Out {
-    ev: Vec<Vec<EvRow>>,
+    ev: Vec<Vec<EvRow>>, // per shard: rows that did not fit in its RowBuf
     ev_long: Vec<(S, EvRow)>, // event_ids over 15 bytes (exact, slow path)
     ck: Vec<CkRow>,
     lk: Vec<(u32, u32)>,
@@ -612,6 +641,8 @@ struct Worker<'a> {
     map: HashMap<S, u32, Hs>, // fallback: long IDs, or the shared table at its limit
     out: Out,
     pend: Vec<Pend>, // user IDs waiting to be interned, in batches
+    bufs: &'a [RowBuf],
+    cur: Vec<(usize, usize)>, // per shard: this thread's current block [next, end)
 }
 
 /// A deferred user-ID lookup and the row field it fills.
@@ -664,7 +695,8 @@ impl<'a> Worker<'a> {
                 None => self.intern_local(key),
             };
             if p.at & EV_AT != 0 {
-                self.out.ev[(p.at & !EV_AT) as usize][p.ix as usize].user = u;
+                // the slot is in a block this thread reserved: only it writes there
+                unsafe { (*self.bufs[(p.at & !EV_AT) as usize].ptr.add(p.ix as usize)).user = u };
             } else {
                 self.out.ck[p.ix as usize].user = u;
             }
@@ -721,10 +753,25 @@ impl<'a> Worker<'a> {
         if eid.len() <= 15 {
             (row.lo, row.hi) = pack(eid);
             let shard = (mix(row.lo, row.hi) >> 56) as usize;
-            self.out.ev[shard].push(row);
-            if defer_user {
-                let ix = (self.out.ev[shard].len() - 1) as u32;
-                self.defer(uid, EV_AT | shard as u32, ix);
+            let (mut a, mut b) = self.cur[shard];
+            if a == b {
+                let buf = &self.bufs[shard];
+                let st = buf.next.fetch_add(BLK, Ordering::Relaxed);
+                (a, b) = (st.min(buf.cap), (st + BLK).min(buf.cap));
+            }
+            if a < b {
+                unsafe { self.bufs[shard].ptr.add(a).write(row) };
+                self.cur[shard] = (a + 1, b);
+                if defer_user {
+                    self.defer(uid, EV_AT | shard as u32, a as u32);
+                }
+            } else {
+                // shard buffer full (estimate too small): overflow, interned now
+                self.cur[shard] = (a, b);
+                if defer_user {
+                    row.user = self.intern(uid);
+                }
+                self.out.ev[shard].push(row);
             }
         } else {
             self.out.ev_long.push((eid, row));
@@ -974,11 +1021,16 @@ fn main() {
     // line (~70 bytes); this allows ~4x that before the fallback kicks in.
     let total_bytes: usize = chunks.iter().map(|c| c.1.len()).sum();
     let shared = SharedTab::new((total_bytes / 70 / 2).next_power_of_two().clamp(1 << 16, 1 << 30));
+    // Row buffers sized from the event bytes (lines are ~70 bytes; this assumes
+    // 55, plus slack for partly used blocks); overflow keeps it exact anyway.
+    let ev_bytes: usize = chunks.iter().filter(|c| c.0 == Kind::Ev).map(|c| c.1.len()).sum();
+    let per_shard = ev_bytes / 55 / NSHARD + BLK * nthreads * 2 + 1024;
+    let bufs: Vec<RowBuf> = (0..NSHARD).map(|_| RowBuf::new(per_shard)).collect();
     let next = AtomicUsize::new(0);
     let outs: Vec<Out> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..nthreads)
             .map(|t| {
-                let (ctx, next, chunks, shared) = (&ctx, &next, &chunks, &shared);
+                let (ctx, next, chunks, shared, bufs) = (&ctx, &next, &chunks, &shared, &bufs);
                 sc.spawn(move || {
                     let mut w = Worker {
                         ctx,
@@ -986,6 +1038,8 @@ fn main() {
                         tsp: TsParser::new(),
                         shared,
                         pend: Vec::with_capacity(BATCH),
+                        bufs,
+                        cur: vec![(0, 0); NSHARD],
                         map: HashMap::with_hasher(hasher()),
                         out: Out {
                             ev: (0..NSHARD).map(|_| Vec::new()).collect(),
@@ -1006,6 +1060,11 @@ fn main() {
                         }
                     }
                     w.flush();
+                    for (sh, &(a, b)) in w.cur.iter().enumerate() {
+                        for i in a..b {
+                            unsafe { w.bufs[sh].ptr.add(i).write(HOLE) };
+                        }
+                    }
                     w.out
                 })
             })
@@ -1124,12 +1183,14 @@ fn main() {
     let csh = bits_for(we - cws);
     assert!(bits_for(nids as i64) + csh.max(tsh) <= 64, "window too long for packed sort keys");
     assert!(tsh <= 32, "event window over 49 days (EvRow keeps ts - window_start in a u32)");
-    let mut shards: Vec<Vec<Vec<EvRow>>> = (0..NSHARD).map(|_| Vec::with_capacity(nthreads)).collect();
+    let mut overflow: Vec<Vec<Vec<EvRow>>> = (0..NSHARD).map(|_| Vec::new()).collect();
     let mut cks_raw: Vec<Vec<CkRow>> = Vec::with_capacity(nthreads);
     let mut ev_long: Vec<(S, EvRow)> = Vec::new();
     for o in outs {
         for (s, v) in o.ev.into_iter().enumerate() {
-            shards[s].push(v);
+            if !v.is_empty() {
+                overflow[s].push(v);
+            }
         }
         cks_raw.push(o.ck);
         ev_long.extend(o.ev_long);
@@ -1142,17 +1203,26 @@ fn main() {
     // can be sorted on its own and the sessions stage can take whole buckets.
     let nb = nthreads * 16;
     let bucket_of = |p: u64| (p as u128 * nb as u128 / nids.max(1) as u128) as usize;
-    let mut ev_parts: Vec<Vec<Vec<Ev>>> = shards
-        .into_par_iter()
-        .map(|parts| {
-            let mut rows: Vec<EvRow> = parts.concat();
-            drop(parts);
-            rows.sort_unstable_by_key(|r| (r.hi, r.lo, r.ing));
+    let mut ev_parts: Vec<Vec<Vec<Ev>>> = bufs
+        .par_iter()
+        .zip(overflow.par_iter())
+        .map(|(buf, over)| {
+            let mut joined: Vec<EvRow>;
+            let rows: &mut [EvRow] = if over.is_empty() {
+                buf.filled()
+            } else {
+                joined = buf.filled().to_vec();
+                for v in over {
+                    joined.extend_from_slice(v);
+                }
+                &mut joined
+            };
+            rows.sort_unstable_by_key(|r| (r.hi, r.lo, r.ing)); // holes (hi == 0) sort first
             let per = rows.len() / nb + rows.len() / (4 * nb) + 4;
             let mut out: Vec<Vec<Ev>> = (0..nb).map(|_| Vec::with_capacity(per)).collect();
             // first row of each event_id run = the copy with the smallest ingest_ts
             for (i, r) in rows.iter().enumerate() {
-                if r.valid && (i == 0 || rows[i - 1].hi != r.hi || rows[i - 1].lo != r.lo) {
+                if r.valid && r.hi != 0 && (i == 0 || rows[i - 1].hi != r.hi || rows[i - 1].lo != r.lo) {
                     let e = to_ev(r);
                     out[bucket_of(e.key >> tsh)].push(e);
                 }
