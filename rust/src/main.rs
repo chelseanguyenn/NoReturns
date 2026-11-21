@@ -366,10 +366,10 @@ enum Kind {
 
 #[derive(Clone, Copy)]
 struct EvRow {
-    h: u64,
-    eid: S,
+    lo: u64, // event_id packed exactly (see pack); over 15 bytes: Out::ev_long
+    hi: u64,
     ing: i64,
-    ts: i64,
+    ts: u32, // ts - window_start (valid rows only)
     user: u32,
     price: u32,
     cat: u16,
@@ -387,6 +387,7 @@ struct CkRow {
 
 struct Out {
     ev: Vec<Vec<EvRow>>,
+    ev_long: Vec<(S, EvRow)>, // event_ids over 15 bytes (exact, slow path)
     ck: Vec<CkRow>,
     lk: Vec<(u32, u32)>,
     new_keys: Vec<(u32, S)>, // global ids this thread created
@@ -400,7 +401,6 @@ struct Ctx<'a> {
     products: &'a HashMap<S, u16, Hs>,
     unknown: u16,
     campaigns: &'a HashMap<S, u32, Hs>,
-    h: Hs,
 }
 
 /// Packs an ID of at most 15 bytes exactly: the bytes, then the length in the
@@ -542,7 +542,7 @@ impl<'a> Worker<'a> {
         let c = self.ctx;
         let ing = parse_iso(ing).unwrap_or(i64::MAX);
         let mut row =
-            EvRow { h: c.h.hash_one(eid), eid, ing, ts: 0, user: 0, price: 0, cat: 0, valid: false, tid: self.tid };
+            EvRow { lo: 0, hi: 0, ing, ts: 0, user: 0, price: 0, cat: 0, valid: false, tid: self.tid };
         // Validity of this copy (rules: validate the kept copy, then drop late events).
         'v: {
             if uid.is_empty() || pid.is_empty() {
@@ -561,12 +561,17 @@ impl<'a> Worker<'a> {
                 _ => break 'v,
             };
             row.valid = true;
-            row.ts = t;
+            row.ts = (t - c.ws) as u32;
             row.price = p;
             row.cat = *c.products.get(pid).unwrap_or(&c.unknown);
             row.user = self.intern(uid);
         }
-        self.out.ev[(row.h >> 56) as usize].push(row);
+        if eid.len() <= 15 {
+            (row.lo, row.hi) = pack(eid);
+            self.out.ev[(mix(row.lo, row.hi) >> 56) as usize].push(row);
+        } else {
+            self.out.ev_long.push((eid, row));
+        }
     }
 
     fn click(&mut self, f: &[S; 4]) {
@@ -801,7 +806,7 @@ fn main() {
     tm.stage("setup/lookups");
 
     // ---------------------------------------------------------- 1. parse
-    let ctx = Ctx { ws, we, cws, products: &products, unknown, campaigns: &campaigns, h: hasher() };
+    let ctx = Ctx { ws, we, cws, products: &products, unknown, campaigns: &campaigns };
     // Sized from the input: generated data has about 0.055 distinct IDs per
     // line (~70 bytes); this allows ~4x that before the fallback kicks in.
     let total_bytes: usize = chunks.iter().map(|c| c.1.len()).sum();
@@ -819,6 +824,7 @@ fn main() {
                         map: HashMap::with_hasher(hasher()),
                         out: Out {
                             ev: (0..NSHARD).map(|_| Vec::new()).collect(),
+                            ev_long: Vec::new(),
                             ck: Vec::new(),
                             lk: Vec::new(),
                             new_keys: Vec::new(),
@@ -951,58 +957,55 @@ fn main() {
     let tsh = bits_for(we - ws);
     let csh = bits_for(we - cws);
     assert!(bits_for(nids as i64) + csh.max(tsh) <= 64, "window too long for packed sort keys");
+    assert!(tsh <= 32, "event window over 49 days (EvRow keeps ts - window_start in a u32)");
     let mut shards: Vec<Vec<Vec<EvRow>>> = (0..NSHARD).map(|_| Vec::with_capacity(nthreads)).collect();
     let mut cks_raw: Vec<Vec<CkRow>> = Vec::with_capacity(nthreads);
+    let mut ev_long: Vec<(S, EvRow)> = Vec::new();
     for o in outs {
         for (s, v) in o.ev.into_iter().enumerate() {
             shards[s].push(v);
         }
         cks_raw.push(o.ck);
+        ev_long.extend(o.ev_long);
     }
+    let to_ev = |r: &EvRow| -> Ev {
+        let p = person_of(r.tid as usize, r.user) as u64;
+        Ev { key: (p << tsh) | r.ts as u64, val: ((r.price as u64) << 16) | r.cat as u64 }
+    };
     // Surviving events go straight into person-range buckets, so each bucket
     // can be sorted on its own and the sessions stage can take whole buckets.
     let nb = nthreads * 16;
     let bucket_of = |p: u64| (p as u128 * nb as u128 / nids.max(1) as u128) as usize;
-    let ev_parts: Vec<Vec<Vec<Ev>>> = shards
+    let mut ev_parts: Vec<Vec<Vec<Ev>>> = shards
         .into_par_iter()
         .map(|parts| {
             let mut rows: Vec<EvRow> = parts.concat();
             drop(parts);
-            rows.sort_unstable_by_key(|r| (r.h, r.ing));
+            rows.sort_unstable_by_key(|r| (r.hi, r.lo, r.ing));
             let per = rows.len() / nb + rows.len() / (4 * nb) + 4;
             let mut out: Vec<Vec<Ev>> = (0..nb).map(|_| Vec::with_capacity(per)).collect();
-            let mut emit = |r: &EvRow| {
-                if r.valid {
-                    let p = person_of(r.tid as usize, r.user) as u64;
-                    out[bucket_of(p)]
-                        .push(Ev { key: (p << tsh) | (r.ts - ws) as u64, val: ((r.price as u64) << 16) | r.cat as u64 });
+            // first row of each event_id run = the copy with the smallest ingest_ts
+            for (i, r) in rows.iter().enumerate() {
+                if r.valid && (i == 0 || rows[i - 1].hi != r.hi || rows[i - 1].lo != r.lo) {
+                    let e = to_ev(r);
+                    out[bucket_of(e.key >> tsh)].push(e);
                 }
-            };
-            let mut i = 0;
-            while i < rows.len() {
-                let mut j = i + 1;
-                let mut same = true;
-                while j < rows.len() && rows[j].h == rows[i].h {
-                    same &= rows[j].eid == rows[i].eid;
-                    j += 1;
-                }
-                if same {
-                    emit(&rows[i]); // the copy with the smallest ingest_ts
-                } else {
-                    // 64-bit hash collision: group exactly by event_id.
-                    let g = &mut rows[i..j];
-                    g.sort_by(|a, b| a.eid.cmp(b.eid).then(a.ing.cmp(&b.ing)));
-                    for k in 0..g.len() {
-                        if k == 0 || g[k].eid != g[k - 1].eid {
-                            emit(&g[k]);
-                        }
-                    }
-                }
-                i = j;
             }
             out
         })
         .collect();
+    // event_ids over 15 bytes: exact dedup by string (normally none)
+    if !ev_long.is_empty() {
+        ev_long.sort_by(|a, b| a.0.cmp(b.0).then(a.1.ing.cmp(&b.1.ing)));
+        let mut out: Vec<Vec<Ev>> = (0..nb).map(|_| Vec::new()).collect();
+        for k in 0..ev_long.len() {
+            if (k == 0 || ev_long[k].0 != ev_long[k - 1].0) && ev_long[k].1.valid {
+                let e = to_ev(&ev_long[k].1);
+                out[bucket_of(e.key >> tsh)].push(e);
+            }
+        }
+        ev_parts.push(out);
+    }
     tm.stage("dedup/validate events");
 
     // ---------------------------------------------------------- 5. sort
