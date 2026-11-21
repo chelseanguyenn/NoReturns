@@ -1017,10 +1017,12 @@ fn main() {
 
     // ---------------------------------------------------------- 1. parse
     let ctx = Ctx { ws, we, cws, products: &products, unknown, campaigns: &campaigns };
-    // Sized from the input: generated data has about 0.055 distinct IDs per
-    // line (~70 bytes); this allows ~4x that before the fallback kicks in.
+    // Sized from the input: generated data has about 1 distinct ID per 15-20
+    // lines (~65 bytes each). The table takes up to lines/8 IDs (its limit is
+    // half its slots); past that, threads fall back to local maps (still exact).
+    // Every slot page gets touched, so oversizing costs real memory.
     let total_bytes: usize = chunks.iter().map(|c| c.1.len()).sum();
-    let shared = SharedTab::new((total_bytes / 70 / 2).next_power_of_two().clamp(1 << 16, 1 << 30));
+    let shared = SharedTab::new((total_bytes / 65 / 4).next_power_of_two().clamp(1 << 16, 1 << 30));
     // Row buffers sized from the event bytes (lines are ~70 bytes; this assumes
     // 55, plus slack for partly used blocks); overflow keeps it exact anyway.
     let ev_bytes: usize = chunks.iter().filter(|c| c.0 == Kind::Ev).map(|c| c.1.len()).sum();
