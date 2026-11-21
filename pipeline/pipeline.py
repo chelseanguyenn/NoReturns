@@ -107,27 +107,34 @@ def field_regex(n):
 # DuckDB's CSV reader is used only as a line splitter: one VARCHAR column, a
 # delimiter, quote, escape and null string that never occur in the data.  It
 # would still end a line at a lone '\r', which the rules treat as an ordinary
-# character, so any file containing '\r' is first copied to scratch with each
-# '\r' replaced by a placeholder byte absent from that file, and the
-# placeholder is turned back into '\r' before parsing.
+# character, so a file containing '\r' is copied to scratch with each '\r'
+# replaced by a placeholder byte absent from that file, and the placeholder is
+# turned back into '\r' before parsing.
+#
+# Finding those files needs a pass over every byte.  It runs in background
+# threads (DuckDB releases the GIL while it works), started for every input
+# file up front, so it overlaps the parsing instead of preceding it.  A table
+# is parsed optimistically as if no file held '\r'; if one did, the table is
+# dropped and parsed again with the placeholder copies.
 RAW_DIR = os.path.join(SCRATCH, "raw_lines")
 RAW_OPTS = ("columns={'line': 'VARCHAR'}, delim='\x01\x02\x03\x04', quote='', escape='', "
             "header=true, auto_detect=false, strict_mode=false, nullstr='\x02\x03\x04\x01'")
 PLACEHOLDERS = [bytes([b]) for b in (0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x0e, 0x0f, 0x10)]
 
 
-def _prepare(job):
-    i, path = job
-    # Scan in 8 MB chunks: bounded memory (a big part file is ~360 MB), and it
-    # warms the page cache for DuckDB's read right after.  (mmap was slower
-    # through Docker's bind mounts.)
+def has_cr(path):
+    # 8 MB chunks: bounded memory (a big part file is ~360 MB).  (mmap was
+    # slower through Docker's bind mounts.)
     with open(path, "rb", buffering=0) as fh:
         while True:
             chunk = fh.read(8 << 20)
             if not chunk:
-                return path, None
+                return False
             if b"\r" in chunk:
-                break
+                return True
+
+
+def cr_copy(i, path):
     with open(path, "rb") as fh:
         data = fh.read()
     ph = next(p for p in PLACEHOLDERS if p not in data)
@@ -136,19 +143,6 @@ def _prepare(job):
     with open(dst, "wb") as fh:
         fh.write(data.replace(b"\r", ph))
     return dst, ph
-
-
-_job_counter = [0]
-
-
-def prepare(files):
-    from concurrent.futures import ThreadPoolExecutor
-    jobs = []
-    for p in files:
-        jobs.append((_job_counter[0], p))
-        _job_counter[0] += 1
-    with ThreadPoolExecutor(max_workers=max(1, NCPU)) as pool:
-        return list(pool.map(_prepare, jobs))
 
 
 def sql_list(paths):
@@ -167,35 +161,50 @@ def load_table(name, files, cols, select=None, where="true"):
     n = len(cols)
     sel = ", ".join(f"nullif(f[{i + 1}], '') AS {c}" for i, c in enumerate(cols))
     select = select or ", ".join(cols)
-    prepared = prepare(files)
-    log(f"  {name}: \\r scan of {len(files)} files done")
-    plain = [p for p, ph in prepared if ph is None]
-    sources = []
-    if plain:
-        sources.append(f"SELECT line FROM read_csv({sql_list(plain)}, {RAW_OPTS})")
-    for p, ph in prepared:
-        if ph is not None:
+
+    def build(cr_files):
+        sources = []
+        plain = [p for p in files if p not in cr_files]
+        if plain:
+            sources.append(f"SELECT line FROM read_csv({sql_list(plain)}, {RAW_OPTS})")
+        for i, p in enumerate(cr_files):
+            dst, ph = cr_copy(i, p)
             sources.append(f"SELECT replace(line, chr({ph[0]}), chr(13)) AS line "
-                           f"FROM read_csv({sql_list([p])}, {RAW_OPTS})")
-    if not sources:
-        sources.append("SELECT NULL::VARCHAR AS line WHERE false")
-    con.execute(f"""
-        CREATE TABLE {name} AS
-        SELECT {select} FROM (
-            SELECT {sel} FROM (
-                SELECT string_split(replace(line, '"', ''), ',') AS f
-                FROM ({" UNION ALL ".join(sources)})
-                WHERE regexp_full_match(line, '{field_regex(n)}')
-            )
-        ) WHERE {where}
-    """)
+                           f"FROM read_csv({sql_list([dst])}, {RAW_OPTS})")
+        if not sources:
+            sources.append("SELECT NULL::VARCHAR AS line WHERE false")
+        con.execute(f"""
+            CREATE OR REPLACE TABLE {name} AS
+            SELECT {select} FROM (
+                SELECT {sel} FROM (
+                    SELECT string_split(replace(line, '"', ''), ',') AS f
+                    FROM ({" UNION ALL ".join(sources)})
+                    WHERE regexp_full_match(line, '{field_regex(n)}')
+                )
+            ) WHERE {where}
+        """)
+
+    build([])
+    cr_files = [p for p in files if CR_SCAN[p].result()]
+    if cr_files:
+        log(f"  {name}: {len(cr_files)} file(s) contain \\r, parsing again")
+        build(cr_files)
+        shutil.rmtree(RAW_DIR, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- inputs
+PRODUCTS, CAMPAIGNS = os.path.join(DATA, "products.csv"), os.path.join(DATA, "campaigns.csv")
+LINK_FILES, EVENT_FILES, CLICK_FILES = csv_files("links"), csv_files("events"), csv_files("clicks")
+# Queued in the order the tables are loaded, so each table's scan is done (or
+# nearly) by the time its parse finishes.  Few threads: it is I/O + memchr.
+from concurrent.futures import ThreadPoolExecutor
+_scan_pool = ThreadPoolExecutor(max_workers=3)
+CR_SCAN = {p: _scan_pool.submit(has_cr, p)
+           for p in [PRODUCTS, CAMPAIGNS] + LINK_FILES + EVENT_FILES + CLICK_FILES}
 stage("setup")
-load_table("products", [os.path.join(DATA, "products.csv")], ["product_id", "category"])
-load_table("campaigns", [os.path.join(DATA, "campaigns.csv")], ["campaign_id", "channel"])
-load_table("links_raw", csv_files("links"), ["a", "b"])
+load_table("products", [PRODUCTS], ["product_id", "category"])
+load_table("campaigns", [CAMPAIGNS], ["campaign_id", "channel"])
+load_table("links_raw", LINK_FILES, ["a", "b"])
 stage("read/parse links+lookups")
 # Events, typed in the parsing pass.  Every copy is typed, but nothing is
 # filtered except an empty event_id: validation applies to the copy dedup
@@ -203,7 +212,7 @@ stage("read/parse links+lookups")
 # prod is kept only for purchases (the only rows that need a category).
 # price is NULL unless the row is a purchase with digits-only price_cents of
 # at most 8 significant digits (anything longer is over 10,000,000 anyway).
-load_table("ev_raw", csv_files("events"),
+load_table("ev_raw", EVENT_FILES,
            ["event_id", "user_id", "ts_s", "ingest_s", "etype", "product_id", "price_s"],
            select=f"""event_id, user_id, parse_ts(ts_s) AS ts,
                       epoch_ms(try_strptime(ingest_s, '%Y-%m-%dT%H:%M:%SZ')) AS ing,
@@ -219,7 +228,7 @@ stage("read/parse events")
 # Clicks are validated in the parsing pass too (no dedup can pick a bad copy:
 # copies are identical).  Duplicates are left in: the credit arg_min and the
 # assist DISTINCT both give the same answer with or without them.
-load_table("ck_raw", csv_files("clicks"), ["click_id", "user_id", "campaign_id", "ts_s"],
+load_table("ck_raw", CLICK_FILES, ["click_id", "user_id", "campaign_id", "ts_s"],
            select="click_id, user_id, campaign_id, parse_ts(ts_s) AS ts",
            where="click_id IS NOT NULL AND user_id IS NOT NULL "
                  "AND campaign_id IN (SELECT campaign_id FROM campaigns)")
