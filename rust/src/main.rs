@@ -312,10 +312,78 @@ struct Ctx<'a> {
     h: Hs,
 }
 
+/// Packs an ID of at most 15 bytes exactly: the bytes, then the length in the
+/// top byte. Equal packs mean equal IDs, and a real pack is never (_, 0).
+#[inline]
+fn pack(s: &[u8]) -> (u64, u64) {
+    let mut b = [0u8; 16];
+    b[..s.len()].copy_from_slice(s);
+    b[15] = s.len() as u8;
+    (u64::from_le_bytes(b[..8].try_into().unwrap()), u64::from_le_bytes(b[8..].try_into().unwrap()))
+}
+
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    lo: u64,
+    hi: u64, // 0 = empty
+    id: u32,
+}
+
+/// Open-addressing (linear probing) table from packed short IDs to local ids:
+/// one slot read per lookup, no string compare.
+struct IdTable {
+    slots: Vec<Slot>,
+    mask: usize,
+    len: usize,
+}
+
+impl IdTable {
+    fn new(cap_pow2: usize) -> Self {
+        IdTable { slots: vec![Slot::default(); cap_pow2], mask: cap_pow2 - 1, len: 0 }
+    }
+    #[inline]
+    fn slot_of(&self, lo: u64, hi: u64) -> usize {
+        let h = (lo ^ hi.wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        ((h ^ (h >> 29)) as usize) & self.mask
+    }
+    fn grow(&mut self) {
+        let old = std::mem::replace(&mut self.slots, vec![Slot::default(); (self.mask + 1) * 2]);
+        self.mask = self.slots.len() - 1;
+        for s in old.into_iter().filter(|s| s.hi != 0) {
+            let mut i = self.slot_of(s.lo, s.hi);
+            while self.slots[i].hi != 0 {
+                i = (i + 1) & self.mask;
+            }
+            self.slots[i] = s;
+        }
+    }
+    #[inline]
+    fn get_or_insert(&mut self, lo: u64, hi: u64, new_id: impl FnOnce() -> u32) -> u32 {
+        if (self.len + 1) * 2 > self.slots.len() {
+            self.grow();
+        }
+        let mut i = self.slot_of(lo, hi);
+        loop {
+            let s = &mut self.slots[i];
+            if s.hi == hi && s.lo == lo {
+                return s.id;
+            }
+            if s.hi == 0 {
+                let id = new_id();
+                *s = Slot { lo, hi, id };
+                self.len += 1;
+                return id;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
 struct Worker<'a> {
     ctx: &'a Ctx<'a>,
     tid: u8,
-    map: HashMap<S, u32, Hs>,
+    tab: IdTable,          // IDs of up to 15 bytes
+    map: HashMap<S, u32, Hs>, // longer IDs (same local id space)
     out: Out,
 }
 
@@ -323,6 +391,13 @@ impl<'a> Worker<'a> {
     #[inline]
     fn intern(&mut self, k: S) -> u32 {
         let keys = &mut self.out.keys;
+        if k.len() <= 15 {
+            let (lo, hi) = pack(k);
+            return self.tab.get_or_insert(lo, hi, || {
+                keys.push(k);
+                (keys.len() - 1) as u32
+            });
+        }
         *self.map.entry(k).or_insert_with(|| {
             keys.push(k);
             (keys.len() - 1) as u32
@@ -615,6 +690,7 @@ fn main() {
                     let mut w = Worker {
                         ctx,
                         tid: t as u8,
+                        tab: IdTable::new(1 << 16),
                         map: HashMap::with_hasher(hasher()),
                         out: Out {
                             ev: (0..NSHARD).map(|_| Vec::new()).collect(),
