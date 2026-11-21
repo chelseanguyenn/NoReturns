@@ -2,6 +2,7 @@
 # Correctness gate for the Rust pipeline. Prints PASS and exits 0 only if
 # every check matches exactly; otherwise prints FAIL lines and exits 1.
 #
+#  0. rust unit tests (cargo test --release)
 #  1. all fixtures against the native binary (rust/target/release/sessions)
 #  2. check-dev: Rust output on $DEV vs $ANSWER
 #  3. seeds 2-13, 15 and 62 (200k events, 50k clicks; generated into $DATA_ROOT/sN when
@@ -34,6 +35,13 @@ fail() { echo "FAIL  $*"; FAILED=1; }
 # ---- build
 if ! (cd rust && cargo build --release --quiet); then
   echo "FAIL  cargo build"; echo FAIL; exit 1
+fi
+
+# ---- 0. unit tests (exhaustive differential tests of the CSV splitter)
+if (cd rust && cargo test --release --quiet) > "$TMP/unit.log" 2>&1; then
+  ok "unit tests: $(grep 'test result' "$TMP/unit.log" | tail -1)"
+else
+  tail -20 "$TMP/unit.log"; fail "unit tests"
 fi
 
 # ---- 1. fixtures
